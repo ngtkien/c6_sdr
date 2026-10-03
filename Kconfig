@@ -1,0 +1,69 @@
+# Copyright (c) Cognition
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "c6_sdr — ESP32-P4 driving c6_sdr hybrid slave firmware"
+
+config C6_SDR_SWEEP_LO_MHZ
+	int "Sweep start frequency (MHz)"
+	default 2400
+
+config C6_SDR_SWEEP_HI_MHZ
+	int "Sweep end frequency (MHz)"
+	default 2500
+
+config C6_SDR_SWEEP_STEP_MHZ
+	int "Sweep step (MHz)"
+	default 20
+
+config C6_SDR_SPEC_MS
+	int "Per-point SPEC run duration (ms)"
+	default 200
+	help
+	  Bounded ring-capture run per frequency point; frames are pulled
+	  after each run completes.
+
+config C6_SDR_RUNS
+	int "Number of sweep repetitions"
+	default 3
+
+config C6_SDR_NFFT
+	int "FFT size (power of two)"
+	default 256
+
+config C6_SDR_STRIDE
+	int "FFT stride (process every Nth unit block)"
+	default 2
+
+config C6_SDR_UNITS_PER_FRAME
+	int "Units merged per emitted frame"
+	default 4
+
+config C6_SDR_MAX_HOLD
+	bool "Per-bin max-hold instead of mean power"
+	default n
+
+config C6_SDR_GAIN
+	int "RX gain code (0..54, 255=HW AGC, 256=keep)"
+	default 255
+
+config C6_SDR_DCAP
+	int "Analog filter code (0..63, 254=auto, 255=keep)"
+	default 254
+
+config C6_SDR_DSI
+	bool "Render waterfall on the DSI panel"
+	default y
+
+config C6_SDR_SD_DUMP
+	bool "Append captures to files on the SD card"
+	default y
+
+config C6_SDR_IQ_BURST
+	bool "Run a single-shot raw-I/Q burst after the sweep"
+	default y
+
+config C6_SDR_IQ_FREQ_MHZ
+	int "I/Q burst center frequency (MHz)"
+	default 2440
+
+source "Kconfig.zephyr"
