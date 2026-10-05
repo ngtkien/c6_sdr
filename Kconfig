@@ -17,12 +17,12 @@ config C6_SDR_SWEEP_STEP_MHZ
 
 config C6_SDR_SPEC_MS
 	int "Per-point SPEC run duration (ms)"
-	default 300
+	default 500
 	help
-	  Bounded ring-capture run per frequency point; frames are pulled
-	  after each run completes. Keep staged bytes (~frames x 270 B)
-	  under the slave's 32 KiB sink or the ring overflows. Longer
-	  runs amortize RPC overhead → faster waterfall scroll.
+	  Bounded ring-capture run per frequency point; frames stream back
+	  while the capture still runs, so the slave's 24 KiB ring only
+	  has to cover pull latency. Longer runs amortize the per-run
+	  start/drain overhead → faster waterfall scroll.
 
 config C6_SDR_RUNS
 	int "Number of sweep repetitions (0 = forever)"
@@ -30,6 +30,17 @@ config C6_SDR_RUNS
 	help
 	  0 keeps sweeping indefinitely — the usual choice when the DSI
 	  waterfall is the live display.
+
+config C6_SDR_DSI_VIEW
+	int "Initial DSI view (0=waterfall, 1=spectrum trace, 2=panorama)"
+	default 1
+	range 0 2
+	depends on C6_SDR_DSI
+	help
+	  Each view owns the full area below the HUD; BOOT button cycles:
+	    0 = scrolling waterfall
+	    1 = live max-hold spectrum trace of the current block
+	    2 = max-hold panorama across the whole sweep range
 
 config C6_SDR_NFFT
 	int "FFT size (power of two)"

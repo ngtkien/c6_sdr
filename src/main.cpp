@@ -20,6 +20,8 @@
 #include <zephyr/device.h>
 #include <zephyr/cache.h>
 #include <zephyr/drivers/display.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/input/input.h>
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/fs/fs.h>
 #include <ff.h>
@@ -112,14 +114,33 @@ static void sd_append(const char *path, const uint8_t *buf, uint32_t len)
 #define PANEL_W   1024
 #define PANEL_H   600
 #define WF_TOP    64   /* rows above this are the HUD */
+#define WF_SCROLL 4    /* rows to shift when the waterfall wraps */
 #define WF_GUTTER 56   /* left column reserved for freq labels */
 #define WF_W      (PANEL_W - WF_GUTTER)
+/* on-screen view button in the HUD (GT911 touch, see touch_cb) */
+#define TBTN_X 930
+#define TBTN_Y 34
+#define TBTN_W 90
+#define TBTN_H 26
+
+/* display modes — cycled by the BOOT button (sw0); each owns the full
+ * area below the HUD — no split views on a 600 px panel */
+enum dsi_view { VIEW_WF = 0, VIEW_SPEC, VIEW_PANO, VIEW_N };
 
 static uint8_t fb[PANEL_W * PANEL_H * 3] __aligned(64)
 	__attribute__((section(".ext_ram.bss")));
 static const struct device *disp;
 static int wf_row = WF_TOP;
+static int wf_top = WF_TOP; /* view-dependent waterfall start row */
 static bool dsi_ok;
+static int dsi_view;
+
+/* live-trace / panorama state */
+static int tr_top, tr_hgt;
+static bool tr_pano;
+static uint8_t tr_h[WF_W];
+static uint32_t tr_freq;       /* block the SPLIT trace belongs to */
+static uint32_t sw_lo_mhz, sw_hi_mhz, sw_step_mhz;
 
 /* HUD live stats, refreshed once per spec call */
 static char hud_link[96], hud_stat[96], hud_iq[96];
@@ -243,6 +264,33 @@ static void fb_text(int x, int y, const char *s, int scale,
 	}
 }
 
+static const char *view_name(void)
+{
+	switch (dsi_view) {
+	case VIEW_SPEC:  return "SPEC";
+	case VIEW_PANO:  return "PANO";
+	default:         return "WFL";
+	}
+}
+
+static const char *view_title(void)
+{
+	switch (dsi_view) {
+	case VIEW_SPEC:  return "PSD MAX-HOLD";
+	case VIEW_PANO:  return "SWEPT SURVEY";
+	default:         return "SPECTROGRAM";
+	}
+}
+
+static void view_color(uint8_t *r, uint8_t *g, uint8_t *b)
+{
+	switch (dsi_view) {
+	case VIEW_SPEC:  *r = 120; *g = 220; *b = 255; break;
+	case VIEW_PANO:  *r = 255; *g = 170; *b = 60;  break;
+	default:         *r = 80;  *g = 255; *b = 160; break;
+	}
+}
+
 /* dB-like bin code -> RGB888 heat ramp (blue->cyan->green->amber->red) */
 static void db_rgb(uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
 {
@@ -278,6 +326,21 @@ static void hud_draw(void)
 	}
 	fb_text(560, 18, "QUIET", 1, 120, 160, 220);
 	fb_text(1024 - 6 * 6, 18, "LOUD", 1, 255, 120, 0);
+	/* chart name, right-aligned in the gap before the VIEW> button */
+	{
+		const char *n = view_title();
+		uint8_t r, g, b;
+
+		view_color(&r, &g, &b);
+		fb_text(920 - 12 * strlen(n), 20, n, 2, r, g, b);
+	}
+	/* on-screen view button (GT911 touch, see touch_cb) */
+	fb_fill(TBTN_X, TBTN_Y, TBTN_W, TBTN_H, 20, 40, 90);
+	fb_fill(TBTN_X, TBTN_Y, TBTN_W, 1, 90, 160, 255);
+	fb_fill(TBTN_X, TBTN_Y + TBTN_H - 1, TBTN_W, 1, 90, 160, 255);
+	fb_fill(TBTN_X, TBTN_Y, 1, TBTN_H, 90, 160, 255);
+	fb_fill(TBTN_X + TBTN_W - 1, TBTN_Y, 1, TBTN_H, 90, 160, 255);
+	fb_text(TBTN_X + 8, TBTN_Y + 6, "VIEW>", 2, 160, 220, 255);
 	fb_fill(0, WF_TOP - 1, PANEL_W, 1, 40, 40, 60);
 }
 
@@ -314,10 +377,197 @@ static void dsi_init(void)
 	LOG_INF("DSI panel up (zero-copy fb)");
 }
 
+/* paint (grow) the max-hold trace bar for column c to height hh */
+static void tr_grow(int c, int hh)
+{
+	uint8_t r, g, b;
+	int base = tr_top + tr_hgt - 1;
+	uint8_t *px = fb + ((base - tr_h[c]) * PANEL_W + WF_GUTTER + c) * 3;
+
+	db_rgb((uint8_t)(hh * 255 / tr_hgt), &r, &g, &b);
+	for (int y = tr_h[c]; y < hh; y++) {
+		px[0] = r; px[1] = g; px[2] = b;
+		px -= PANEL_W * 3;
+	}
+	tr_h[c] = hh;
+}
+
+/* eSpDR-style spectrum trace.
+ * SPLIT: max-hold bar chart of the current block's nfft bins.
+ * PANO:  each bin lands on the sweep-frequency axis (80 MHz span per
+ *        block) — a full-band panorama that accumulates over the sweep. */
+static void dsi_trace(const uint8_t *bins, uint32_t nfft, uint32_t freq_hz)
+{
+	if (!tr_hgt) {
+		return;
+	}
+	if (!tr_pano) {
+		/* per-block trace: reset when the tuned freq changes */
+		if (freq_hz != tr_freq) {
+			tr_freq = freq_hz;
+			memset(tr_h, 0, sizeof(tr_h));
+			fb_fill(WF_GUTTER, tr_top, WF_W, tr_hgt, 0, 0, 8);
+		}
+		for (int c = 0; c < WF_W; c++) {
+			uint8_t v = bins[c * nfft / WF_W];
+			int hh = v * (tr_hgt - 1) / 255;
+
+			if (hh > tr_h[c]) {
+				tr_grow(c, hh);
+			}
+		}
+	} else {
+		/* panorama: bin frequency = tune + (b - nfft/2) * 80MHz/nfft */
+		uint32_t lo_hz = (sw_lo_mhz - 40) * 1000000u;
+		uint32_t span_hz = (sw_hi_mhz - sw_lo_mhz + 80) * 1000000u;
+		int64_t bin_hz = 80000000ll / nfft;
+
+		for (uint32_t b = 0; b < nfft; b++) {
+			int64_t fbq = (int64_t)freq_hz +
+				((int32_t)b - (int32_t)nfft / 2) * bin_hz;
+			int px = (int)((fbq - lo_hz) * WF_W / span_hz);
+			int hh;
+
+			if (px < 0 || px >= WF_W) {
+				continue;
+			}
+			hh = bins[b] * (tr_hgt - 1) / 255;
+			if (hh > tr_h[px]) {
+				tr_grow(px, hh);
+			}
+		}
+	}
+	sys_cache_data_flush_range(fb + tr_top * PANEL_W * 3,
+				   tr_hgt * PANEL_W * 3);
+}
+
+/* freq grid for the panorama: vertical line + label every sweep step */
+static void pano_grid(void)
+{
+	uint32_t lo_hz = (sw_lo_mhz - 40) * 1000000u;
+	uint32_t span_hz = (sw_hi_mhz - sw_lo_mhz + 80) * 1000000u;
+	int base = tr_top + tr_hgt - 1;
+
+	for (uint32_t f = sw_lo_mhz; f <= sw_hi_mhz; f += sw_step_mhz) {
+		int px = (int)(((int64_t)f * 1000000 - lo_hz) * WF_W / span_hz);
+
+		fb_fill(WF_GUTTER + px, tr_top, 1, tr_hgt, 30, 30, 50);
+		char lab[8];
+		snprintf(lab, sizeof(lab), "%u", f);
+		fb_text(WF_GUTTER + px + 2, base - 8, lab, 1,
+			100, 100, 140);
+	}
+}
+
+/* switch display mode: relayout regions, clear, reset state */
+static void dsi_view_apply(int v)
+{
+	dsi_view = v;
+	memset(tr_h, 0, sizeof(tr_h));
+	tr_freq = 0;
+	label_end_row = -1;
+	if (v == VIEW_SPEC) {
+		tr_top = WF_TOP;
+		tr_hgt = PANEL_H - WF_TOP - 12;
+		tr_pano = false;
+		wf_top = PANEL_H; /* trace owns the frame, no waterfall */
+	} else if (v == VIEW_PANO) {
+		tr_top = WF_TOP;
+		tr_hgt = PANEL_H - WF_TOP - 12;
+		tr_pano = true;
+		wf_top = PANEL_H;
+	} else {
+		tr_top = 0;
+		tr_hgt = 0;
+		wf_top = WF_TOP;
+	}
+	fb_fill(0, WF_TOP, PANEL_W, PANEL_H - WF_TOP, 0, 0, 8);
+	if (tr_hgt) {
+		/* baseline + quarter-height gridlines */
+		int base = tr_top + tr_hgt - 1;
+
+		for (int i = 0; i < 4; i++) {
+			fb_fill(WF_GUTTER, base - tr_hgt * i / 4, WF_W, 1,
+				30, 30, 50);
+		}
+		if (tr_pano) {
+			pano_grid();
+		}
+	}
+	fb_fill(0, wf_top - 1, PANEL_W, 1, 40, 40, 60);
+	wf_row = wf_top;
+	sys_cache_data_flush_range(fb + WF_TOP * PANEL_W * 3,
+				   (PANEL_H - WF_TOP) * PANEL_W * 3);
+}
+
+/* touch-button rect inside the HUD (drawn by hud_draw) */
+static volatile bool touch_req;
+
+/* GT911 touch via Zephyr input: track position, flag presses inside the
+ * on-screen button — dsi_view_apply runs on the app thread instead. */
+static void touch_cb(struct input_event *evt, void *user_data)
+{
+	static int32_t tx, ty;
+
+	(void)user_data;
+	if (evt->type == INPUT_EV_ABS) {
+		if (evt->code == INPUT_ABS_X) {
+			tx = evt->value;
+		} else if (evt->code == INPUT_ABS_Y) {
+			ty = evt->value;
+		}
+	} else if (evt->type == INPUT_EV_KEY &&
+		   evt->code == INPUT_BTN_TOUCH && evt->value) {
+		if (tx >= TBTN_X && tx < TBTN_X + TBTN_W &&
+		    ty >= TBTN_Y && ty < TBTN_Y + TBTN_H) {
+			touch_req = true;
+		}
+	}
+}
+INPUT_CALLBACK_DEFINE(NULL, touch_cb, NULL);
+
+/* BOOT button edge-detect; call frequently from the frame path */
+static const struct gpio_dt_spec boot_btn =
+	GPIO_DT_SPEC_GET_OR(DT_ALIAS(sw0), gpios, {0});
+static int btn_prev = -1; /* -1 = unread */
+static int64_t btn_ms;
+static void view_button_poll(void)
+{
+	int now;
+	int64_t t;
+
+	if (touch_req) { /* on-screen VIEW> button */
+		touch_req = false;
+		dsi_view_apply((dsi_view + 1) % VIEW_N);
+		printk("view: %s (touch)\n", view_name());
+	}
+	if (!boot_btn.port) {
+		return;
+	}
+	now = gpio_pin_get_dt(&boot_btn);
+	if (btn_prev < 0) {
+		btn_prev = now;
+		btn_ms = k_uptime_get();
+		return;
+	}
+	t = k_uptime_get();
+	if (!now && btn_prev && t - btn_ms > 400) { /* pressed edge */
+		btn_ms = t;
+		dsi_view_apply((dsi_view + 1) % VIEW_N);
+		printk("view: %s\n", view_name());
+	}
+	btn_prev = now;
+}
+
 /* paint one spectrum row at wf_row; bins are dB-like codes */
 static void dsi_spec_row(const uint8_t *bins, uint32_t nfft)
 {
-	uint8_t *row = fb + wf_row * PANEL_W * 3;
+	uint8_t *row;
+
+	if (wf_top >= PANEL_H) {
+		return; /* PANO: no waterfall region */
+	}
+	row = fb + wf_row * PANEL_W * 3;
 
 	/* gutter: clear unless inside the live label span */
 	if (wf_row < label_end_row - 14 || wf_row >= label_end_row) {
@@ -345,9 +595,21 @@ static void dsi_spec_row(const uint8_t *bins, uint32_t nfft)
 		db_rgb(bins[c * nfft / WF_W], &r, &g, &b);
 		px[0] = r; px[1] = g; px[2] = b;
 	}
-	sys_cache_data_flush_range(row, PANEL_W * 3);
 	if (++wf_row >= PANEL_H) {
-		wf_row = WF_TOP;
+		/* bottom reached: scroll the waterfall up a few rows instead
+		 * of jumping back to the top — newest rows stay at the
+		 * bottom and history slides up continuously */
+		uint8_t *base = fb + wf_top * PANEL_W * 3;
+
+		memmove(base, base + WF_SCROLL * PANEL_W * 3,
+			(PANEL_H - wf_top - WF_SCROLL) * PANEL_W * 3);
+		wf_row = PANEL_H - WF_SCROLL;
+		label_end_row -= MIN(label_end_row, WF_SCROLL);
+		/* the whole region was rewritten — flush it once */
+		sys_cache_data_flush_range(base,
+				(PANEL_H - wf_top) * PANEL_W * 3);
+	} else {
+		sys_cache_data_flush_range(row, PANEL_W * 3);
 	}
 }
 
@@ -378,6 +640,8 @@ static bool sdr_row_cb(const struct sdr_spc1 *h, const uint8_t *bins,
 	fps_rows++;
 	fps_tick();
 	if (dsi_ok) {
+		view_button_poll();
+		dsi_trace(bins, nfft, freq);
 		dsi_spec_row(bins, nfft);
 	}
 	return true;
@@ -386,8 +650,8 @@ static bool sdr_row_cb(const struct sdr_spc1 *h, const uint8_t *bins,
 static void hud_update(void)
 {
 	snprintf(hud_stat, sizeof(hud_stat),
-		 "FPS%u.%u SWP%u ROWS%u DRP%u %uKB F%uMHZ%s",
-		 fps_x10 / 10, fps_x10 % 10,
+		 "FPS%u.%u %s SWP%u ROWS%u DRP%u %uKB F%uMHZ%s",
+		 fps_x10 / 10, fps_x10 % 10, view_name(),
 		 st_sweep, st_rows, st_drops, st_staged / 1024,
 		 st_freq_mhz, st_fails ? "  *FAIL*" : "");
 }
@@ -431,6 +695,10 @@ int main(void)
 	uint32_t f_lo = CONFIG_C6_SDR_SWEEP_LO_MHZ;
 	uint32_t f_hi = CONFIG_C6_SDR_SWEEP_HI_MHZ;
 	uint32_t f_step = CONFIG_C6_SDR_SWEEP_STEP_MHZ;
+
+	sw_lo_mhz = f_lo;
+	sw_hi_mhz = f_hi;
+	sw_step_mhz = f_step;
 	uint32_t dur = CONFIG_C6_SDR_SPEC_MS;
 	uint32_t n_runs = CONFIG_C6_SDR_RUNS;
 	uint32_t gain = CONFIG_C6_SDR_GAIN;
@@ -465,6 +733,10 @@ int main(void)
 
 #ifdef CONFIG_C6_SDR_DSI
 	dsi_init();
+	if (boot_btn.port) {
+		gpio_pin_configure_dt(&boot_btn, GPIO_INPUT);
+	}
+	dsi_view_apply(CONFIG_C6_SDR_DSI_VIEW);
 #endif
 
 	/* ---- single-shot I/Q burst (once, feeds the HUD + SD dump) ---- */
@@ -511,66 +783,49 @@ int main(void)
 		}
 	}
 
-	/* ---- spectrum sweep: one bounded SPEC run per step ---- */
+	/* ---- spectrum sweep: one async SPEC stream per step; rows paint
+	 * live in sdr_row_cb while the C6 is still capturing ---- */
 	for (uint32_t run = 0; n_runs == 0 || run < n_runs; run++) {
 		uint32_t total = 0;
-		struct esp_ng_sdr_run_res res;
 		int ret;
 
 		st_sweep = run + 1;
 		for (uint32_t f = f_lo; f <= f_hi; f += f_step) {
-			uint32_t len = 0;
+			uint32_t nbytes = 0;
+			int frames = 0;
 
 			st_freq_mhz = f;
 			st_label_pending = true;
-			ret = sdr_spec_pull(f * 1000000u, 256,
-					    CONFIG_C6_SDR_STRIDE,
-					    CONFIG_C6_SDR_UNITS_PER_FRAME,
-					    IS_ENABLED(CONFIG_C6_SDR_MAX_HOLD),
-					    gain, CONFIG_C6_SDR_DCAP,
-					    dur, cap_buf, CAP_MAX, &len, &res);
+			ret = sdr_spec_stream(f * 1000000u, 256,
+					      CONFIG_C6_SDR_STRIDE,
+					      CONFIG_C6_SDR_UNITS_PER_FRAME,
+					      IS_ENABLED(CONFIG_C6_SDR_MAX_HOLD),
+					      gain, CONFIG_C6_SDR_DCAP,
+					      dur, 0,
+					      sdr_row_cb,
+					      (void *)(uintptr_t)(f *
+								  1000000u),
+					      &nbytes, &frames);
+			if (ret == -ENODATA || (ret == 0 && !frames)) {
+				printk("spec %u MHz: no SPC1 frames\n", f);
+				fail++;
+				st_fails = fail;
+				continue;
+			}
 			if (ret) {
 				printk("spec %u MHz: rpc err %d\n", f, ret);
 				fail++;
 				st_fails = fail;
 				continue;
 			}
-			total += len;
-			int frames = sdr_walk_spc1(cap_buf, len, sdr_row_cb,
-						   (void *)(uintptr_t)(f *
-								       1000000u));
-			if (res.status && !frames) {
-				printk("spec %u MHz: ring status %u/%u\n",
-				       f, res.status, res.detail);
-				fail++;
-				st_fails = fail;
-				continue;
-			}
-			if (res.status) {
-				/* sink overflowed mid-run — partial frames
-				 * are still valid spectrum; drops counted */
-				printk("spec %u MHz: %u/%u frames, ring "
-				       "st %u\n", f, frames, res.detail,
-				       res.status);
-			}
-			if (!frames) {
-				printk("spec %u MHz: %u B, no SPC1 frames\n",
-				       f, len);
-				fail++;
-				st_fails = fail;
-				continue;
-			}
-			st_staged += len;
+			total += nbytes;
+			st_staged += nbytes;
 			hud_update();
 			if (dsi_ok) {
 				dsi_hud();
 			}
-			if (IS_ENABLED(CONFIG_C6_SDR_SD_DUMP) && sd_ok && len) {
-				sd_append("/SD:/c6_sdr_spec.bin", cap_buf,
-					  len);
-			}
 		}
-		printk("sweep %u done: %u B staged total\n", run + 1, total);
+		printk("sweep %u done: %u B streamed\n", run + 1, total);
 	}
 
 done:

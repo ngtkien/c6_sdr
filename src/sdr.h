@@ -43,6 +43,19 @@ int sdr_spec_pull(uint32_t freq_hz, uint16_t nfft, uint8_t stride,
 int sdr_pull_all(uint32_t total_len, uint8_t *buf, uint32_t buf_cap,
 		 uint32_t *out_len);
 
+/* Stream a SPEC capture: the slave runs asynchronously and cb() fires
+ * per SPC1 frame as it lands on the host. duration_ms bounds the run
+ * (0 = run until max_frames / cb false / slave stall); max_frames = 0
+ * drains to the natural end. Returns 0 with *out_frames/*out_bytes set,
+ * -ENODATA if nothing arrived, or a negative transport error. */
+int sdr_spec_stream(uint32_t freq_hz, uint16_t nfft, uint8_t stride,
+		    uint8_t units_per_frame, uint8_t max_hold,
+		    uint32_t gain, uint32_t dcap, uint32_t duration_ms,
+		    uint32_t max_frames,
+		    bool (*cb)(const struct sdr_spc1 *, const uint8_t *,
+			       void *),
+		    void *arg, uint32_t *out_bytes, int *out_frames);
+
 /* Iterate SPC1 frames in a pulled blob. Returns parsed frame count;
  * cb() runs per frame with header + bins (NULL-safe to skip SPS1/other
  * records). cb return false stops the walk. */
