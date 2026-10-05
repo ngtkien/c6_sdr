@@ -1,36 +1,123 @@
 # c6_sdr — ESP32-P4 spectrum / raw-IQ front-end over the C6
 
-Software-defined-radio demo pair for the ESP32-P4 Function EV board:
+Software-defined-radio pair for the ESP32-P4 Function EV board:
 
 - `c6_firmware/` — hybrid ESP32-C6 slave firmware: ESP-Hosted-MCU
-  (hosted v1.4.7, SDIO transport, RPC + OTA intact) **plus** the
+  (hosted v1.4.90, SDIO transport, RPC + OTA intact) **plus** the
   [ESP-SDR](https://github.com/codelabs-ch/esp-sdr) RF-capture engine.
   The C6 keeps answering hosted RPCs while also exposing SDR commands —
   so the P4 can call it like a "scan" API and the C6 can still be
-  updated over the air (no ESP-Prog needed to leave this firmware).
+  updated over the air (no ESP-Prog needed once this firmware is on).
 - `src/` — Zephyr app on the P4: drives the SDR RPCs over the existing
-  SDIO link and renders/dumps the results.
+  SDIO link, renders live on the 1024×600 DSI panel, and can dump
+  results + screenshots to SD.
 
-Unlike the standalone ESP-SDR port (UART I/Q out on PROG_C6), everything
-here flows through the same SDIO hosted link already wired between the
+Everything flows through the SDIO hosted link already wired between the
 P4 and the C6 — no extra cabling.
 
-## Radio path on the C6
+## Display views
 
-- PHY tuned directly (`phy_set_freq`, `chip_v7_set_chan`),
-  `WIFI_MODE_NULL` + RX-only; Bluetooth disabled to reclaim SRAM.
-- Verified path: 80 MS/s raw RF dump into the two SRAM banks at
-  `0x40820000`/`0x40840000` (16 384 IQ pairs each, 10-bit packed).
-- SPEC mode runs a 256-point Q15 FFT on-chip (esp-dsp twiddles) and emits
-  `SPC1` frames: 28-byte header + `nfft` 8-bit log-power bins + CRC32 —
-  compact enough for a single RPC response payload.
-- Raw-IQ burst mode captures up to 16 380 pairs and packs them as raw
-  u32 words, iq8 (2 B/pair) or iq10, staged for chunked readback.
-- Captured output lives in a ~96 KiB slave-side ring sink; the host
-  pulls it with `SdrIqRead` chunks (≤ 1400 B each, fits the SDIO/TLV
-  frame budget).
+The 1024×600 panel runs four full-screen chart pages. Cycle them with
+the on-screen **`VIEW>`** button or the physical **BOOT** button
+(`sw0`). The active page title and a 3-letter tag stay in the HUD.
 
-## Host RPC API (new, ids 380–383 / 680–683)
+### SPEC — PSD max-hold trace
+
+![PSD max-hold spectrum trace](docs/images/view_spec.png)
+
+A 256-point log-power FFT bar trace of the currently-tuned 80 MHz
+block, accumulated as max-hold (bars rise and stay). The white overlay
+is the live trace of the newest frame; the bars behind it are the
+max-hold envelope. Left gutter shows quarter-scale level tags.
+The dip in the middle is the LO/DC notch at the tuned frequency —
+occupied Wi-Fi energy is visible climbing toward the block edges.
+
+### PANO — swept survey
+
+![Swept panorama survey](docs/images/view_pano.png)
+
+Max-hold panorama stitched across the whole 2360–2540 MHz sweep band —
+each pixel column maps a fixed RF frequency, so the picture builds up a
+station survey of the 2.4 GHz ISM band. Vertical gridlines + MHz labels
+mark each 20 MHz sweep step. Fades slowly (decay) so dead channels
+clear. This is the "which channels are busy" page.
+
+### WFL — spectrogram (waterfall)
+
+![Scrolling spectrogram waterfall](docs/images/view_wfl.png)
+
+Time × frequency heat map: every incoming FFT frame paints one pixel
+row and history scrolls upward continuously. Horizontal streaks are
+persistent carriers (beacons, data channels); vertical smears are
+wideband bursts. MHz labels in the left gutter scroll with their block
+— the label sits on the tuned freq of the row it was captured at.
+
+### IQ — constellation scope
+
+![IQ constellation scope](docs/images/view_iq.png)
+
+Live iq8 bursts (~16 k pairs at ~3 ms/read) rendered as a phosphor
+persistence scope: a 512×512 density map accumulates each burst and
+decays ⅛ per frame, colored through the same dB heat ramp — signal
+structure persists like a CRT. A dim cyan polyline overlays the latest
+burst's sample trajectory (rotation direction = above/below LO).
+Auto-scaled to a smoothed peak (`±N LSB` tag bottom-left), DC-centred
+on the measured mean — the small magenta cross marks the DC offset
+(LO leakage). Right column: `I(t)`, `Q(t)` oscilloscope strips and the
+`dF` instantaneous-frequency trace (diff-phase = live FM demod).
+Stats line shows `I µ / Q µ / RMS` (cloud ring-vs-blob metric), current
+freq, pair count. **`FRQ`** button parks the scope on one frequency —
+set a marker on PANO/SPEC first and it locks there; otherwise it uses
+the current sweep step. The donut-shaped cloud in the capture is a
+noise-dominated channel; a hard carrier draws a thin rotating ring.
+
+## Controls
+
+| Control | Where | Action |
+|---|---|---|
+| `VIEW>` | HUD button / BOOT button | cycle SPEC → PANO → WFL → IQ |
+| `HOLD` | HUD button | freeze chart updates (stream keeps running) |
+| `CLR` | HUD button | wipe max-hold / panorama / phosphor + marker |
+| `FRQ` | IQ page only | lock bursts to marker freq (or current step) |
+| `CAP` | HUD button | screenshot: `scr_<view>.bmp` on SD + RGB565 dump on UART |
+| tap | chart area (not IQ) | magenta marker + `X.XM` freq readout |
+| `c` / `v` | console UART | capture screen / cycle view (scriptable) |
+
+The HUD shows MAC + firmware version (`1.4.90` = c6_sdr hybrid), FPS,
+sweep counter, row/drop counts, staged KB, current freq, `*FAIL*`
+flag and `RCV` (link-recovery count) tags, plus a dB colorbar.
+
+## Architecture
+
+```
+ C6                          P4 (Zephyr)
+ ┌──────────────────┐  SDIO  ┌────────────────────────────┐
+ │ SDR engine       │ frames │ sdr.cpp: SPEC/IQ RPC pulls │
+ │ 80 MS/s capture  │───────▶│ main.cpp: sweep loop       │
+ │ (IRQs masked)    │  RPC   │   │ rows → disp_q msgq       │
+ │ ring sink 96 KiB │◀───────│   ▼                        │
+ │ FFT → SPC1       │        │ disp_thread: paint → fb    │
+ │ iq8 bursts       │        │ scope_thread: IQ page      │
+ │ protocomm/RPC    │        │ DSI zero-copy scanout 56Hz │
+ └──────────────────┘        └────────────────────────────┘
+```
+
+- **Async SPEC runs** — `SdrSpec` kicks a C6-side run task and returns
+  immediately; the P4 drains the ring with `SdrIqRead(offset)` chunks
+  while capture continues (absolute-offset reads, `EAGAIN`=alive,
+  `ENOENT`=drained, resync on overrun).
+- **Display decoupling** — `sdr_row_cb` only enqueues a `disp_row`;
+  `disp_thread` does all painting so transport pacing never blocks on
+  cache flushes. The DSI framebuffer is scanned out zero-copy by the
+  GDMA — painting is a PSRAM write + cache writeback.
+- **Link watchdog** — three consecutive RPC failures (`rpc tx -116`,
+  e.g. after a C6 reboot) trigger `esp_ng_slave_reinit()`: EN pulse,
+  re-enumerate, verify MAC, resume the sweep. `RCV` tag in HUD counts
+  recoveries.
+- **Reset forensics** — the C6 logs `esp_reset_reason()` at boot so a
+  mid-run reboot identifies itself (watchdog vs panic vs brownout).
+
+## Host RPC API (ids 380–383)
 
 Declared in `zephyr-esp32p4-v1-bsp/drivers/wifi/esp_hosted_ng/esp_hosted_ng.h`:
 
@@ -42,83 +129,67 @@ int esp_ng_sdr_iq_read(uint32_t offset, uint8_t *buf, uint32_t buf_len,
 int esp_ng_sdr_stop(void);
 ```
 
-- `SdrSpec` is synchronous on the slave: tune → run the ring for
-  `duration_ms` → respond `{status, total_len, frames, pairs, rate_hz}`.
-- Then pull `total_len` bytes via `SdrIqRead(offset, …)` and parse
-  `SPC1` frames (`sdr_walk_spc1` in `src/sdr.cpp`).
-- `SdrIqStart` mode 0 = single-shot burst (`n_words` = 256..16380 pairs);
-  mode 1 = ring run (C6: raw ring data, no S3-style decimation).
+- SPEC run emits `SPC1` frames: 28-byte header + `nfft` 8-bit
+  log-power bins + CRC32 (`sdr_walk_spc1` in `src/sdr.cpp`).
+- `SdrIqStart` mode 0 = single-shot burst (`n_words` = 256..16380
+  pairs); mode 1 = ring run.
 - `gain`: 255 = hardware AGC, 256 = keep, else manual code 0–54.
   `dcap`: 254 = PHY auto, 255 = keep, else filter code 0–63.
-- Note: a `duration_ms = 0` SPEC run blocks the slave RPC task until the
-  sink fills (≈96 KiB) + host-stall timeout (~2 s), then finishes on its
-  own — use bounded durations in normal operation.
+- RPC pacing ≈3 ms per read at ~1400 B/chunk — effective stream rate
+  ~100–145 KB/s per sweep step.
 
-## Zephyr app
+## Screen capture / SD
 
-Boot → hosted link check (MAC + `GetCoprocessorFwVersion`, warns if the
-C6 is still stock) → single-shot I/Q burst → `C6_SDR_RUNS` sweeps
-(`0` = forever) of bounded `SdrSpec` runs from `C6_SDR_SWEEP_LO_MHZ` to
-`C6_SDR_SWEEP_HI_MHZ`. Outputs (Kconfig):
+- `CAP` button or `c` on the console dumps:
+  - `/SD:/scr_<view>.bmp` — full-res 1024×600 24-bit BMP, and
+  - a `@@SCR`-framed RGB565 half-res image on the UART (crc16-checked;
+    `tools/` reassembles it into PNG — the images above came out this
+    way).
+- SD writes self-heal: a mounted-but-unwritable card is reformatted
+  (`fs_mkfs` FAT) once, then SD output disables after repeated
+  failures. `CONFIG_C6_SDR_SD_DUMP` also streams raw `c6_sdr_spec.bin` /
+  `c6_sdr_iq.bin` captures to the card.
 
-- `C6_SDR_DSI=y` (default) — EK79007 DSI panel, 1024×600: scrolling
-  RGB888 heat-map waterfall (one row pushed per SPC1 frame, so the
-  display updates live), per-frequency MHz labels in the left gutter,
-  and a HUD with C6 MAC/fw version, live counters (sweep, rows, drops,
-  staged KB, current freq) and a dB colorbar.
-- `C6_SDR_ASCII_WF` — 96-column ASCII waterfall on the console
-  (`freq bin-row ffts gain drops`). Defaults to on only when DSI is
-  off; sweep summaries + errors always print either way.
-- `C6_SDR_SD_DUMP` — staged bytes appended to `/SD:/c6_sdr_spec.bin`,
-  IQ burst to `/SD:/c6_sdr_iq.bin`. A card that rejects writes is
-  disabled automatically after 4 failures.
+## Build / flash
 
 ```bash
-# 1. build + flash the C6 hybrid firmware (ESP-IDF ≥ 5.3)
-cd c6_firmware
-idf.py set-target esp32c6 && idf.py build
-# then flash via ESP-Prog on PROG_C6 (see below), OR OTA it from the
-# c6_ota project if the C6 still runs hosted firmware:
+# 1. C6 hybrid firmware (ESP-IDF 5.4)
+cd c6_firmware && idf.py build
+# OTA it if the C6 still runs hosted firmware:
 #   C6_FW_FILE=c6_firmware/build/network_adapter.bin ../c6_ota/build.sh
+#   ../c6_ota/flash.sh /dev/ttyUSB2
 
-# 2. build + flash the P4 app
+# 2. P4 app
 ./build.sh
 ./flash.sh /dev/ttyUSB2     # P4 console port
 ```
 
-`network_adapter.bin` (~868 KiB) fits the 1536 KiB OTA slot, so the whole
-cycle is reachable without opening the case.
+`network_adapter.bin` (~870 KiB) fits the C6's 1536 KiB OTA slot — the
+whole cycle is reachable without opening the case.
 
-## Flashing / restoring the C6
+## Recovery / restoring the C6
 
-- **From hosted firmware (stock or v1.4.7):** plain OTA through
-  `projects/c6_ota` works — the hybrid answers the same RPCs.
-- **From standalone ESP-SDR or any non-hosted image:** the hosted link
-  is gone — use `c6_ota`'s recovery mode (`CONFIG_C6_RECOVERY=y` or a
-  `/SD:/c6_download.flg` file): the P4 drives C6 BOOT via GPIO47 and
-  EN via GPIO54 into ROM download mode, then flash over the PROG_C6
-  UART:
-
-  ```bash
-  esptool --chip esp32c6 -p <PORT> -b 460800 write-flash \
-      --flash-mode dio --flash-freq 80m --flash-size 4MB \
-      0x0     build/bootloader/bootloader.bin \
-      0x8000  build/partition_table/partition-table.bin \
-      0xd000  build/ota_data_initial.bin \
-      0x10000 build/network_adapter.bin
-  ```
-
-- The hybrid itself still implements `OTABegin/Write/End`, so once it is
-  on the C6 you can OTA back to a stock hosted image any time.
+- **From hosted firmware:** plain OTA through `projects/c6_ota`.
+- **From a dead/non-hosted image:** `c6_ota` recovery mode drives C6
+  BOOT (P4 GPIO47) and EN (GPIO54) into ROM download, then flash over
+  the PROG_C6 UART with esptool.
+- The hybrid still implements `OTABegin/Write/End`, so you can OTA back
+  to a stock hosted image any time.
+- Runtime link wedges self-recover via the watchdog — the console shows
+  `link: recovered after C6 reset` and the HUD shows `RCV`.
 
 ## Caveats
 
 - The SDR capture path uses undocumented PHY/RF-register behavior from
-  the ESP-SDR project — **hardware validation is required** before
-  trusting absolute power levels; bin values are log-power codes
-  (`db_step` in the frame header), not calibrated dBm.
-- While a capture runs, the C6 masks interrupts on both cores — hosted
-  RPC/SDIO traffic stalls for the run duration. Keep `duration_ms`
-  modest; chunk pulls happen after the run.
+  ESP-SDR — **hardware validation is required** before trusting
+  absolute levels; bins are log-power codes (`db_step` in the header),
+  not calibrated dBm.
+- During a capture the C6 masks interrupts (bank-switch deadlines are
+  ~180 µs), so hosted RPC traffic stalls for the run duration — the
+  async SPEC design drains in the gaps between runs. ~100–115 rows/s is
+  the honest ceiling at the ~3 ms RPC round-trip.
+- Continuous FM audio is not feasible: the C6 has no decimated-IQ path
+  (S3-only) and ~250 kS/s IQ would need ~5× the link throughput — the
+  IQ page + demod blip is the honest version of that demo.
 - 100–6000 MHz tuning range; the useful instantaneous view is the
   ~40 MHz analog front-end bandwidth around the tuned frequency.

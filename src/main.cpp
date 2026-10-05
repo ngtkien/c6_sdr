@@ -21,6 +21,7 @@
 #include <zephyr/cache.h>
 #include <zephyr/drivers/display.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/input/input.h>
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/fs/fs.h>
@@ -48,6 +49,7 @@ static struct fs_mount_t mp = {
 };
 static bool sd_ok;
 static int sd_fail_streak;
+static bool sd_fmt_tried;
 
 static void sd_mount_try(void)
 {
@@ -58,14 +60,32 @@ static void sd_mount_try(void)
 	}
 }
 
-/* card-side writes fail hard on some cards — give up after a few */
+/* card-side writes fail hard on some cards — reformat once, then give
+ * up after a few */
 static void sd_rc(int rc)
 {
-	if (rc < 0 && ++sd_fail_streak >= 4) {
+	if (rc >= 0) {
+		sd_fail_streak = 0;
+		return;
+	}
+	if (!sd_fmt_tried) {
+		/* corrupt FAT can mount fine but fail every write —
+		 * reformat once and remount before giving up */
+		sd_fmt_tried = true;
+		printk("sd: write err %d — mkfs FAT + remount\n", rc);
+		fs_unmount(&mp);
+		mp.fs_data = &fat_fs;
+		if (fs_mkfs(FS_FATFS, (uintptr_t)"SD:", NULL, 0) == 0 &&
+		    fs_mount(&mp) == 0) {
+			printk("sd: reformatted — writes re-enabled\n");
+			sd_fail_streak = 0;
+			return;
+		}
+		printk("sd: mkfs/remount failed\n");
+	}
+	if (++sd_fail_streak >= 4) {
 		sd_ok = false;
 		printk("sd: writes failing (%d), disabling SD dump\n", rc);
-	} else if (rc >= 0) {
-		sd_fail_streak = 0;
 	}
 }
 
@@ -112,6 +132,9 @@ static void sd_append(const char *path, const uint8_t *buf, uint32_t len)
 	sd_rc(rc);
 }
 
+static volatile bool cap_req;
+static volatile bool cap_busy;   /* sweep loop idles while a dump runs */
+
 /* ---------- DSI waterfall + HUD ---------- */
 #define PANEL_W   1024
 #define PANEL_H   600
@@ -126,6 +149,7 @@ static void sd_append(const char *path, const uint8_t *buf, uint32_t len)
 #define TBTN_H 26
 #define HBTN_X 800   /* HOLD: freeze/pause the chart updates */
 #define CBTN_X 864   /* CLR:  clear max-hold/pano + marker  */
+#define PBTN_X 736   /* CAP:  screenshot to SD + UART dump  */
 #define FBTN_X 940   /* FRQ:  IQ page freq-lock button (drawn in page) */
 #define FBTN_Y 552
 #define FBTN_W 80
@@ -376,6 +400,13 @@ static void hud_draw(void)
 	fb_fill(CBTN_X, SBTN_Y, 1, SBTN_H, 90, 160, 255);
 	fb_fill(CBTN_X + SBTN_W - 1, SBTN_Y, 1, SBTN_H, 90, 160, 255);
 	fb_text(CBTN_X + 10, SBTN_Y + 6, "CLR", 2, 160, 220, 255);
+	/* CAP button */
+	fb_fill(PBTN_X, SBTN_Y, SBTN_W, SBTN_H, 20, 40, 90);
+	fb_fill(PBTN_X, SBTN_Y, SBTN_W, 1, 90, 160, 255);
+	fb_fill(PBTN_X, SBTN_Y + SBTN_H - 1, SBTN_W, 1, 90, 160, 255);
+	fb_fill(PBTN_X, SBTN_Y, 1, SBTN_H, 90, 160, 255);
+	fb_fill(PBTN_X + SBTN_W - 1, SBTN_Y, 1, SBTN_H, 90, 160, 255);
+	fb_text(PBTN_X + 12, SBTN_Y + 6, "CAP", 2, 160, 220, 255);
 	fb_fill(0, WF_TOP - 1, PANEL_W, 1, 40, 40, 60);
 }
 
@@ -833,6 +864,112 @@ static void iq_blip(const int8_t *xy, uint32_t n)
 	audio_play(pcm, 2048);
 }
 
+/* ---------- screen capture: BMP to SD + RGB565 dump over UART ----------
+ * Triggered by the CAP button or 'c' on the console. UART frame:
+ * "@@SCR w h len\n" + raw RGB565 payload + crc16 — a host script can
+ * reassemble a PNG without touching the SD card. */
+static void put32le(uint8_t *p, uint32_t v)
+{
+	p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+
+static void cap_uart_dump(const struct device *con)
+{
+	enum { DW = 512, DH = 300 };
+	static uint8_t pix[DW * 2];
+	uint16_t crc = 0xffff;
+
+	printk("@@SCR %u %u %lu\n", (uint32_t)DW, (uint32_t)DH,
+	       (unsigned long)(DW * DH * 2));
+	for (int y = 0; y < DH; y++) {
+		const uint8_t *row = fb + (y * 2) * PANEL_W * 3;
+
+		for (int x = 0; x < DW; x++) {
+			const uint8_t *s = row + x * 6;
+			uint16_t v = ((s[0] & 0xf8) << 8) |
+				     ((s[1] & 0xfc) << 3) | (s[2] >> 3);
+
+			pix[x * 2] = v & 0xff;
+			pix[x * 2 + 1] = v >> 8;
+		}
+		for (uint32_t i = 0; i < DW * 2; i++) {
+			crc ^= (uint16_t)pix[i] << 8;
+			for (int b = 0; b < 8; b++) {
+				crc = crc & 0x8000 ?
+					(crc << 1) ^ 0x1021 : crc << 1;
+			}
+			uart_poll_out(con, pix[i]);
+		}
+	}
+	uart_poll_out(con, crc & 0xff);
+	uart_poll_out(con, crc >> 8);
+	uart_poll_out(con, '\n');
+	printk("cap: uart frame done (crc %04x)\n", crc);
+}
+
+static void cap_sd_bmp(void)
+{
+	static uint8_t hdr[54];
+	static uint8_t row[PANEL_W * 3];
+	struct fs_file_t f;
+	char path[32];
+	uint32_t imgsz = PANEL_W * PANEL_H * 3;
+	int rc = 0;
+
+	if (!sd_ok) {
+		return;
+	}
+	snprintf(path, sizeof(path), "/SD:/scr_%s.bmp", view_name());
+	fs_file_t_init(&f);
+	if (fs_open(&f, path, FS_O_CREATE | FS_O_WRITE) != 0) {
+		return;
+	}
+	memset(hdr, 0, sizeof(hdr));
+	hdr[0] = 'B'; hdr[1] = 'M';
+	put32le(hdr + 2, 54 + imgsz);       /* file size           */
+	put32le(hdr + 10, 54);              /* pixel data offset   */
+	put32le(hdr + 14, 40);              /* info header size    */
+	put32le(hdr + 18, PANEL_W);
+	put32le(hdr + 22, PANEL_H);
+	hdr[26] = 1;                        /* planes              */
+	hdr[28] = 24;                       /* bpp                 */
+	put32le(hdr + 34, imgsz);
+	put32le(hdr + 38, 2835);            /* ~72 DPI             */
+	put32le(hdr + 42, 2835);
+	fs_write(&f, hdr, 54);
+	for (int y = PANEL_H - 1; y >= 0; y--) {
+		const uint8_t *s = fb + y * PANEL_W * 3;
+
+		for (int x = 0; x < PANEL_W; x++) {
+			row[x * 3] = s[x * 3 + 2];
+			row[x * 3 + 1] = s[x * 3 + 1];
+			row[x * 3 + 2] = s[x * 3];
+		}
+		rc = fs_write(&f, row, sizeof(row));
+		if (rc < 0) {
+			break;
+		}
+	}
+	fs_close(&f);
+	sd_rc(rc);
+	if (rc >= 0) {
+		printk("cap: %s written\n", path);
+	}
+}
+
+static void cap_dump(void)
+{
+	const struct device *con =
+		DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+
+	cap_busy = true;
+	cap_sd_bmp();
+	if (con && device_is_ready(con)) {
+		cap_uart_dump(con);
+	}
+	cap_busy = false;
+}
+
 /* freq grid for the panorama: vertical line + label every sweep step */
 static void pano_grid(void)
 {
@@ -932,6 +1069,9 @@ static void touch_cb(struct input_event *evt, void *user_data)
 		} else if (tx >= CBTN_X && tx < CBTN_X + SBTN_W &&
 			   ty >= SBTN_Y && ty < SBTN_Y + SBTN_H) {
 			clr_req = true;
+		} else if (tx >= PBTN_X && tx < PBTN_X + SBTN_W &&
+			   ty >= SBTN_Y && ty < SBTN_Y + SBTN_H) {
+			cap_req = true;
 		} else if (dsi_view == VIEW_IQ &&
 			   tx >= FBTN_X && tx < FBTN_X + FBTN_W &&
 			   ty >= FBTN_Y && ty < FBTN_Y + FBTN_H) {
@@ -1146,8 +1286,26 @@ K_THREAD_DEFINE(disp_th, 4096, disp_thread, NULL, NULL, NULL,
  * drops iq8 bursts into iq_pts and this repaints + plays them */
 static void scope_thread(void *a, void *b, void *c)
 {
+	const struct device *con =
+		DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+	uint8_t ch;
+
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	for (;;) {
+		/* console remote: 'v' cycles view, 'c' captures screen */
+		if (con && device_is_ready(con)) {
+			while (uart_poll_in(con, &ch) == 0) {
+				if (ch == 'v' || ch == 'V') {
+					touch_req = true;
+				} else if (ch == 'c' || ch == 'C') {
+					cap_req = true;
+				}
+			}
+		}
+		if (cap_req) {
+			cap_req = false;
+			cap_dump();
+		}
 		if (dsi_ok && dsi_view == VIEW_IQ && !disp_hold &&
 		    iq_seen != iq_seq) {
 			dsi_scope();
@@ -1370,6 +1528,9 @@ int main(void)
 			uint32_t nbytes = 0;
 			int frames = 0;
 
+			while (cap_busy) { /* UART dump owns the console */
+				k_msleep(50);
+			}
 			st_freq_mhz = f;
 			st_label_pending = true;
 			if (dsi_ok && dsi_view == VIEW_IQ) {
