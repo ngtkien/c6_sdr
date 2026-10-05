@@ -14,6 +14,8 @@
 // limitations under the License.
 
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "esp_log.h"
@@ -1975,6 +1977,14 @@ extern void tx_pwctrl_background(uint8_t en, int arg);
 extern void bt_track_pll_cap(void);
 extern void txcal_work_mode(void);  /* ROM: tone-off cleanup */
 extern void ets_delay_us(uint32_t us);
+static void tone_trace(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	fflush(stdout);
+}
 
 #define PHYFUN_TXCAL_DBG   37       /* rom_txcal_debuge_mode */
 #define PHYFUN_TONE_STEP   38       /* rom_start_tx_tone_step */
@@ -1982,7 +1992,9 @@ extern void ets_delay_us(uint32_t us);
 
 static void rf_chan_set(uint8_t chan)
 {
+	tone_trace("tone> A RFChannelSel(%u)\n", chan);
 	RFChannelSel(chan, 0);
+	tone_trace("tone> B chansel done\n");
 	if (phy_param[10]) {
 		for (int s = 10; s; s--) {
 			ets_delay_us(20);
@@ -1990,28 +2002,36 @@ static void rf_chan_set(uint8_t chan)
 				break;
 		}
 	}
+	tone_trace("tone> C pll done\n");
 	if (phy_tx_pwr_track_en) {
 		tx_pwctrl_background(phy_tx_pwr_correct_en, 0);
 		bt_track_pll_cap();
 	}
+	tone_trace("tone> D pwrtrack done\n");
 }
 
 static void rf_tone_set(uint8_t chan, uint32_t backoff, bool on)
 {
 	typedef void (*tone_fn)(int, int, int, int, int, int);
 	if (!on) {
+		tone_trace("tone> off: step(0,...)\n");
 		((tone_fn)g_phyFuns[PHYFUN_TONE_STEP])(0, 0, 0, 0, 0, 0);
 		txcal_work_mode();
+		tone_trace("tone> off done\n");
 		return;
 	}
 	rf_chan_set(chan);
+	tone_trace("tone> E txcal_dbg\n");
 	((void (*)(int))g_phyFuns[PHYFUN_TXCAL_DBG])(0);
+	tone_trace("tone> F chan_cal\n");
 	int base = ((int (*)(uint8_t *, int))g_phyFuns[PHYFUN_CHAN_CAL])
 			(phy_param + 0xf4, chan);
+	tone_trace("tone> G base=%d\n", base);
 	int pwr = (int)(int8_t)(base + backoff + 12);
 	if (pwr < 0)
 		pwr = 0;
 	((tone_fn)g_phyFuns[PHYFUN_TONE_STEP])(1, 0, pwr & 0xff, 0, 0, 0);
+	tone_trace("tone> H tone on pwr=%d\n", pwr);
 }
 
 static esp_err_t req_sdr_spec_handler(Rpc *req, Rpc *resp, void *priv_data)
@@ -2057,13 +2077,20 @@ static esp_err_t req_sdr_iq_start_handler(Rpc *req, Rpc *resp, void *priv_data)
 			RpcReqSdrIqStart, req_sdr_iq_start,
 			rpc__resp__sdr_iq_start__init);
 
-	RPC_RET_FAIL_IF(sdr_ensure_radio());
+	tone_trace("iqstart> mode=%u\n", req_payload->mode);
 	if (req_payload->mode == 2 || req_payload->mode == 3) {
-		/* mode 2/3: factory CW tone — emits real RF on TX! */
+		/* mode 2/3: factory CW tone — emits real RF on TX! — runs
+		 * before sdr_ensure_radio(): the tone path wants raw RF and
+		 * ensure_radio can block the RPC task. */
 		uint32_t chan = req_payload->freq_hz >= 2407000000u ?
 			(req_payload->freq_hz - 2407000000u) / 5000000u : 6;
+		uint32_t bkoff;
+
+		tone_trace("tone> rpc mode=%u freq=%u gain=%u\n",
+			   req_payload->mode, req_payload->freq_hz,
+			   req_payload->gain);
 		chan = chan < 1 ? 1 : chan > 14 ? 14 : chan;
-		uint32_t bkoff = req_payload->gain <= 88 ? req_payload->gain : 0;
+		bkoff = req_payload->gain <= 88 ? req_payload->gain : 0;
 		if (req_payload->mode == 2 && !rf_tone_on) {
 			rf_tone_set(chan, bkoff, true);
 			rf_tone_on = true;
@@ -2071,10 +2098,12 @@ static esp_err_t req_sdr_iq_start_handler(Rpc *req, Rpc *resp, void *priv_data)
 			rf_tone_set(chan, 0, false);
 			rf_tone_on = false;
 		}
+		tone_trace("tone> resp chan=%u on=%u\n", chan, rf_tone_on);
 		resp_payload->pairs = chan;
 		resp_payload->detail = rf_tone_on ? 1 : 0;
 		return ESP_OK;
 	}
+	RPC_RET_FAIL_IF(sdr_ensure_radio());
 	if (req_payload->gain != 256) {
 		resp_payload->resp = sdr_set_gain(req_payload->gain == 255 ?
 				-1 : (int)req_payload->gain);
