@@ -546,9 +546,11 @@ static void dsi_trace(const uint8_t *bins, uint32_t nfft, uint32_t freq_hz)
 #define WV_X 560                   /* I/Q waveform strips             */
 #define WV_W 440
 #define WI_Y (SC_Y)
-#define WI_H 200
-#define WQ_Y (SC_Y + 232)
-#define WQ_H 200
+#define WI_H 140
+#define WQ_Y (SC_Y + 150)
+#define WQ_H 140
+#define WP_Y (SC_Y + 300)          /* inst-frequency strip            */
+#define WP_H 140
 static int8_t iq_pts[2 * IQ_PTS_CAP];
 static uint32_t iq_npairs;
 static uint8_t iq_den[SC_W * SC_H] __attribute__((section(".ext_ram.bss")));
@@ -585,6 +587,58 @@ static void iq_circle(int cx, int cy, int r, uint8_t cr, uint8_t cg,
 			y--;
 		}
 		x++;
+	}
+}
+
+/* clipped dim segment between two scope points (trajectory overlay) */
+static void iq_seg(int x0, int y0, int x1, int y1,
+		   uint8_t cr, uint8_t cg, uint8_t cb)
+{
+	int dx = x1 - x0, dy = y1 - y0;
+	int steps = MAX(dx < 0 ? -dx : dx, dy < 0 ? -dy : dy);
+
+	if (steps > 1024) {
+		steps = 1024;
+	}
+	for (int i = 0; i <= steps; i++) {
+		int x = x0 + dx * i / (steps ? steps : 1);
+		int y = y0 + dy * i / (steps ? steps : 1);
+
+		if ((unsigned)(x - SC_X) < SC_W &&
+		    (unsigned)(y - SC_Y) < SC_H) {
+			uint8_t *p = fb + (y * PANEL_W + x) * 3;
+
+			p[0] = cr; p[1] = cg; p[2] = cb;
+		}
+	}
+}
+
+/* instantaneous-frequency strip: diff-phase per pair = FM demod trace */
+static void iq_dev(int x0, int y0, int w, int h)
+{
+	int mid = y0 + h / 2;
+	uint32_t n = iq_npairs > 1 ? iq_npairs - 1 : 1;
+
+	fb_fill(x0, y0, w, h, 4, 4, 12);
+	fb_fill(x0, mid, w, 1, 50, 50, 70);
+	fb_text(x0 + 4, y0 + 4, "dF", 1, 60, 90, 110);
+	for (int c = 0; c < w; c++) {
+		uint32_t k = (uint32_t)c * n / w + 1;
+		int dI = (int)iq_pts[2 * k] * iq_pts[2 * k - 2] +
+			 (int)iq_pts[2 * k + 1] * iq_pts[2 * k - 1];
+		int dQ = (int)iq_pts[2 * k + 1] * iq_pts[2 * k - 2] -
+			 (int)iq_pts[2 * k] * iq_pts[2 * k - 1];
+		float ph = atan2f((float)dQ, (float)dI);
+		int y = mid - (int)(ph * (h / 2 - 8) / 3.14159f);
+		uint8_t *p;
+
+		if (y < y0 + 2) {
+			y = y0 + 2;
+		} else if (y > y0 + h - 3) {
+			y = y0 + h - 3;
+		}
+		p = fb + (y * PANEL_W + x0 + c) * 3;
+		p[0] = 120; p[1] = 160; p[2] = 255;
 	}
 }
 
@@ -628,11 +682,14 @@ static void dsi_scope(void)
 	}
 	iq_seen = iq_seq;
 
-	/* burst stats → DC + smoothed autoscale peak */
+	/* burst stats → DC + smoothed autoscale peak + cloud RMS */
+	int64_t sumsq = 0;
+
 	for (uint32_t i = 0; i < n; i++) {
 		int vi = iq_pts[i * 2], vq = iq_pts[i * 2 + 1];
 
 		isum += vi; qsum += vq;
+		sumsq += (int64_t)vi * vi + (int64_t)vq * vq;
 		if (vi < 0) {
 			vi = -vi;
 		}
@@ -650,6 +707,10 @@ static void dsi_scope(void)
 	iq_mean_q = (int)(qsum / n);
 	iq_peak = MAX((uint32_t)pk, (iq_peak * 15) >> 4);
 	int scale = (SC_W / 2 - 24) * 256 / (int)iq_peak; /* Q8 px/LSB */
+	/* cloud RMS around the DC point — tight ring vs blob measure */
+	uint32_t iq_rms = (uint32_t)sqrtf(
+		(float)(sumsq / (int64_t)n) -
+		(float)(iq_mean_i * iq_mean_i + iq_mean_q * iq_mean_q));
 
 	/* phosphor decay, then accumulate the burst */
 	for (int i = 0; i < SC_W * SC_H; i++) {
@@ -682,6 +743,23 @@ static void dsi_scope(void)
 			p += 3;
 		}
 	}
+	/* latest-burst trajectory — dim cyan polyline over the phosphor */
+	{
+		uint32_t step = n > 4096 ? n / 4096 : 1;
+		int px_prev = -1, py_prev = 0;
+
+		for (uint32_t i = 0; i < n; i += step) {
+			int x = cx + (((iq_pts[i * 2] - iq_mean_i) * scale) >> 8);
+			int y = cy -
+				(((iq_pts[i * 2 + 1] - iq_mean_q) * scale) >> 8);
+
+			if (px_prev >= 0) {
+				iq_seg(px_prev, py_prev, x, y, 30, 130, 160);
+			}
+			px_prev = x;
+			py_prev = y;
+		}
+	}
 	/* reticle: cross + three radius guides */
 	fb_fill(cx - SC_W / 2 + 4, cy, SC_W - 8, 1, 45, 45, 65);
 	fb_fill(cx, cy - SC_H / 2 + 4, 1, SC_H - 8, 45, 45, 65);
@@ -702,19 +780,22 @@ static void dsi_scope(void)
 	/* scale + stats */
 	snprintf(lab, sizeof(lab), "+-%u LSB", iq_peak);
 	fb_text(SC_X + 6, SC_Y + SC_H - 14, lab, 1, 140, 140, 180);
-	snprintf(lab, sizeof(lab), "I u%d  Q u%d%s", iq_mean_i, iq_mean_q,
-		 iq_lock ? "  FRQ" : "");
+	snprintf(lab, sizeof(lab), "I u%d  Q u%d  RMS%u", iq_mean_i,
+		 iq_mean_q, iq_rms);
 	fb_text(SC_X + 6, SC_Y + 6, lab, 1, 140, 140, 180);
 
-	/* right column: I(t) and Q(t) strips + stats block */
+	/* right column: I(t), Q(t), inst-freq strips + stats block */
 	iq_wave(WV_X, WI_Y, WV_W, WI_H, 0, iq_peak, 80, 220, 140, "I(t)");
 	iq_wave(WV_X, WQ_Y, WV_W, WQ_H, 1, iq_peak, 255, 180, 60, "Q(t)");
-	snprintf(lab, sizeof(lab), "F %u.%u MHz%s  %lu pairs",
-		 iq_lock ? iq_lock_hz / 1000000 : st_freq_mhz,
-		 iq_lock ? (iq_lock_hz / 100000) % 10 : 0,
+	iq_dev(WV_X, WP_Y, WV_W, WP_H);
+	snprintf(lab, sizeof(lab), "F %lu.%lu MHz%s  %lu pairs",
+		 (unsigned long)((iq_lock ? iq_lock_hz
+					   : st_freq_mhz * 1000000u) / 1000000),
+		 (unsigned long)((iq_lock ? iq_lock_hz
+					   : st_freq_mhz * 1000000u) / 100000 % 10),
 		 iq_lock ? " LOCK" : "",
 		 (unsigned long)iq_npairs);
-	fb_text(WV_X + 4, WQ_Y + WQ_H + 16, lab, 1, 120, 120, 160);
+	fb_text(WV_X + 4, WP_Y + WP_H + 10, lab, 1, 120, 120, 160);
 
 	/* FRQ lock button (IQ page only) */
 	fb_fill(FBTN_X, FBTN_Y, FBTN_W, FBTN_H,
