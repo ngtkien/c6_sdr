@@ -156,6 +156,7 @@ static uint32_t sw_lo_mhz, sw_hi_mhz, sw_step_mhz;
 /* HUD live stats, refreshed once per spec call */
 static char hud_link[96], hud_stat[96], hud_iq[96];
 static uint32_t st_rows, st_drops, st_staged, st_sweep, st_fails;
+static uint32_t link_recovers;
 static uint32_t st_freq_mhz;
 static bool st_label_pending;
 static uint32_t paint_freq_mhz; /* display-thread's row freq for labels */
@@ -935,10 +936,11 @@ static bool sdr_row_cb(const struct sdr_spc1 *h, const uint8_t *bins,
 static void hud_update(void)
 {
 	snprintf(hud_stat, sizeof(hud_stat),
-		 "FPS%u.%u %s SWP%u ROWS%u DRP%u %uKB F%uMHZ%s",
+		 "FPS%u.%u %s SWP%u ROWS%u DRP%u %uKB F%uMHZ%s%s",
 		 fps_x10 / 10, fps_x10 % 10, view_name(),
 		 st_sweep, st_rows, st_drops, st_staged / 1024,
-		 st_freq_mhz, st_fails ? "  *FAIL*" : "");
+		 st_freq_mhz, st_fails ? "  *FAIL*" : "",
+		 link_recovers ? "  RCV" : "");
 }
 
 /* ---------- link + demo ---------- */
@@ -971,6 +973,32 @@ static int link_check(uint8_t mac[6])
 	printk("link: hosted SDIO up, C6 STA MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
 	       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 	return 0;
+}
+
+/* Mid-run recovery: the C6 occasionally self-reboots mid-burst and the
+ * P4 then sees rpc tx -116 until the bus re-enumerates. Don't wait for
+ * the transport to notice on its own — pulse EN, wait for slave init,
+ * verify the link answers. */
+static int link_recover(void)
+{
+	for (int i = 0; i < 3; i++) {
+		if (esp_ng_slave_reinit() == 0 &&
+		    esp_ng_wait_slave_init(K_SECONDS(20)) == 0 &&
+		    esp_ng_dev() && device_is_ready(esp_ng_dev()) &&
+		    esp_ng_slave_mac((uint8_t[6]){0}) == 0) {
+			link_recovers++;
+			printk("link: recovered after C6 reset (#%u)\n",
+			       link_recovers);
+			hud_update();
+			if (dsi_ok) {
+				dsi_hud();
+			}
+			return 0;
+		}
+		k_sleep(K_SECONDS(2));
+	}
+	printk("link: recover failed\n");
+	return -EIO;
 }
 
 int main(void)
@@ -1073,6 +1101,7 @@ int main(void)
 	 * live in sdr_row_cb while the C6 is still capturing ---- */
 	for (uint32_t run = 0; n_runs == 0 || run < n_runs; run++) {
 		uint32_t total = 0;
+		uint32_t consec_fail = 0;
 		int ret;
 
 		st_sweep = run + 1;
@@ -1093,6 +1122,16 @@ int main(void)
 							ESP_NG_SDR_DCAP_AUTO,
 							cap_buf, CAP_MAX,
 							&ilen, &ires);
+				if (ret) {
+					fail++;
+					st_fails = fail;
+					if (++consec_fail >= 3 &&
+					    link_recover() == 0) {
+						consec_fail = 0;
+					}
+				} else {
+					consec_fail = 0;
+				}
 				if (!ret && ilen >= 8 && !ires.status) {
 					uint32_t n = MIN(ilen / 2,
 							 IQ_SCOPE_PTS);
@@ -1122,14 +1161,23 @@ int main(void)
 				printk("spec %u MHz: no SPC1 frames\n", f);
 				fail++;
 				st_fails = fail;
+				if (++consec_fail >= 3 &&
+				    link_recover() == 0) {
+					consec_fail = 0;
+				}
 				continue;
 			}
 			if (ret) {
 				printk("spec %u MHz: rpc err %d\n", f, ret);
 				fail++;
 				st_fails = fail;
+				if (++consec_fail >= 3 &&
+				    link_recover() == 0) {
+					consec_fail = 0;
+				}
 				continue;
 			}
+			consec_fail = 0;
 			total += nbytes;
 			st_staged += nbytes;
 			hud_update();

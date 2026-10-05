@@ -37,6 +37,7 @@
 #include "slave_bt.h"
 #include "stats.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "mempool.h"
 
@@ -123,6 +124,20 @@ static void print_firmware_version()
   #endif
 #endif
 	ESP_LOGI(TAG, "*********************************************************************");
+}
+
+static void print_reset_reason(void)
+{
+	/* Surface watchdog/panic resets so a mid-run reboot on the host's
+	 * console log explains itself (power-on and EN-pin resets are
+	 * expected; anything else is a firmware bug worth chasing). */
+	esp_reset_reason_t r = esp_reset_reason();
+	ESP_LOGI(TAG, "reset reason: %d%s", (int)r,
+		 r == ESP_RST_INT_WDT  ? " (interrupt wdt)" :
+		 r == ESP_RST_TASK_WDT ? " (task wdt)" :
+		 r == ESP_RST_WDT      ? " (other wdt)" :
+		 r == ESP_RST_PANIC    ? " (panic)" :
+		 r == ESP_RST_BROWNOUT ? " (brownout)" : "");
 }
 
 static uint8_t get_capabilities(void)
@@ -851,6 +866,7 @@ void app_main()
 	uint8_t prio_q_idx = 0;
 
 	print_firmware_version();
+	print_reset_reason();
 	register_reset_pin(CONFIG_ESP_GPIO_SLAVE_RESET);
 
 	/* SDR capture sink must come out of the heap before protocomm,
