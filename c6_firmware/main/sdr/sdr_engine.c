@@ -87,7 +87,9 @@ static void prepare_rx(void) {
  * SPEC frames and packed bursts append to sdr_cap; raw ring-CAPTURE units
  * stay in the SRAM banks and are read back through the unit table.
  */
-#define SDR_CAP_SIZE (96 * 1024)
+/* Hosted heap tops out around ~120 KiB; transport ~47 KiB + wifi ~35 KiB
+ * leaves <40 KiB — 96 KiB was never reachable, 48 KiB starves sdio_init. */
+#define SDR_CAP_SIZE (32 * 1024)
 /* Heap-allocated at engine init: the .bss region must stay below the
  * 0x40820000 RF-dump guard, so the 96 KiB sink lives in the heap above
  * the reserved ring banks instead. */
@@ -216,17 +218,30 @@ int sdr_set_freq(uint32_t hz) {
 
 /* ---- init ----------------------------------------------------------------- */
 
+/* Take the capture sink before wifi/RPC buffers fragment the heap.
+ * Call from app_main — by the time the first SDR RPC arrives the wifi
+ * pool has eaten ~35 KiB and a 96 KiB block no longer fits. */
+int sdr_engine_prealloc(void) {
+    if (sdr_cap) {
+        return ESP_OK;
+    }
+    sdr_cap = heap_caps_malloc(SDR_CAP_SIZE,
+                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!sdr_cap) {
+        ESP_LOGE(TAG, "capture buffer alloc failed (%u B)", SDR_CAP_SIZE);
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "capture sink %u KiB reserved", SDR_CAP_SIZE / 1024);
+    return ESP_OK;
+}
+
 int sdr_engine_init(void) {
     /* Caller has already run esp_wifi_init/set_storage/set_mode(NULL)/
      * start/ps(NONE)/promiscuous(1)/set_channel — same sequence esp-sdr's
      * app_main uses to park the radio for raw receive. */
-    if (!sdr_cap) {
-        sdr_cap = heap_caps_malloc(SDR_CAP_SIZE,
-                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!sdr_cap) {
-            ESP_LOGE(TAG, "capture buffer alloc failed (%u B)", SDR_CAP_SIZE);
-            return ESP_ERR_NO_MEM;
-        }
+    esp_err_t ret = sdr_engine_prealloc();
+    if (ret != ESP_OK) {
+        return ret;
     }
     ring_capture_init();
     prepare_rx();

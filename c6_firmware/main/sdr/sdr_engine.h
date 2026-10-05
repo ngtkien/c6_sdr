@@ -24,6 +24,7 @@ typedef struct {
 	bool     stopped;
 } sdr_run_result_t;
 
+int  sdr_engine_prealloc(void);  /* reserve the capture sink early (pre-wifi heap) */
 int  sdr_engine_init(void);      /* radio → SDR mode; call once after esp_wifi_init */
 bool sdr_engine_ready(void);
 int  sdr_set_freq(uint32_t hz);  /* retune; also applied per-call */

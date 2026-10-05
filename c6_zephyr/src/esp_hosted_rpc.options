@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# nanopb field sizing for ESP-Hosted-NG esp_hosted_rpc.proto
+
+*.ssid              max_size:33
+*.bssid             max_size:8
+*.mac               max_size:8
+*.resp_mac          max_size:8
+*.dmac              max_size:8
+*.dest_mac          max_size:8
+*.peer_mac          max_size:8
+*.peer_macaddr      max_size:8
+*.da                max_size:8
+*.password          max_size:65
+*.passphrase        max_size:65
+*.cc                max_size:4
+*.country           max_size:4
+*.pin_code          max_size:12
+*.sae_h2e_identifier max_size:17
+*.data              max_size:1600
+*.ota_data          max_size:1400
+*.payload           max_size:64
+*.buf               max_size:64
+*.init_data         max_size:0
+
+*.ap_records        max_count:40
+*.ap_creds          max_count:4
+*.sta               max_count:8
+*.ftm_report_data   max_count:8
+*.gpio_cfgs         max_count:8
+
+esp_hosted_rpc.proto max_size:64 max_count:4 anonymous_oneof:true type:FT_STATIC

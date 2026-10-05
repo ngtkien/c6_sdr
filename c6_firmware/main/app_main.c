@@ -28,6 +28,7 @@
 #if CONFIG_BT_ENABLED
 #include "esp_bt.h"
 #endif
+#include "sdr/sdr_engine.h"
 #include "endian.h"
 
 #include <protocomm.h>
@@ -851,6 +852,11 @@ void app_main()
 
 	print_firmware_version();
 	register_reset_pin(CONFIG_ESP_GPIO_SLAVE_RESET);
+
+	/* SDR capture sink must come out of the heap before protocomm,
+	 * transport queues and (host-triggered) wifi init fragment it —
+	 * after wifi bring-up the largest free block is ~27 KiB. */
+	sdr_engine_prealloc();
 
 	capa = get_capabilities();
 	ext_capa = get_capabilities_ext();

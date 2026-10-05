@@ -1951,7 +1951,11 @@ static esp_err_t sdr_ensure_radio(void)
 	return sdr_engine_init();
 }
 
-#define SDR_MAX_READ_CHUNK 1400u /* keep under the host rpc buffer */
+/* Host pulls staged capture via chunked SdrIqRead. The SDIO send path
+ * mallocs chunk+41B with MALLOC_CAP_DMA; post-wifi lfb-dma is <1 KiB, so
+ * 1400 B responses fail malloc and the host times out. 640 B (681 B
+ * with overhead) still clears the ~816 B worst-case free block. */
+#define SDR_MAX_READ_CHUNK 640u /* keep under the host rpc buffer */
 
 static esp_err_t req_sdr_spec_handler(Rpc *req, Rpc *resp, void *priv_data)
 {
@@ -1966,7 +1970,9 @@ static esp_err_t req_sdr_spec_handler(Rpc *req, Rpc *resp, void *priv_data)
 		RPC_RET_FAIL_IF(resp_payload->resp);
 	}
 	if (req_payload->dcap != 255) {
-		resp_payload->resp = sdr_set_analog_bw(req_payload->dcap);
+		/* proto: 254 = PHY auto; engine: 0 = auto */
+		resp_payload->resp = sdr_set_analog_bw(req_payload->dcap == 254 ?
+				0 : req_payload->dcap);
 		RPC_RET_FAIL_IF(resp_payload->resp);
 	}
 
@@ -1976,6 +1982,12 @@ static esp_err_t req_sdr_spec_handler(Rpc *req, Rpc *resp, void *priv_data)
 			(uint8_t)req_payload->stride, (uint8_t)req_payload->units_per_frame,
 			req_payload->max_hold, req_payload->stats,
 			req_payload->duration_ms, &r);
+	ESP_LOGI(TAG, "spec run: rc=%d st=%u/%u units=%lu pairs=%llu "
+	       "ffts=%lu frames=%lu drops=%lu len=%lu",
+	       rc, (unsigned)r.status, (unsigned)r.detail,
+	       (unsigned long)r.units, (unsigned long long)r.pairs,
+	       (unsigned long)r.ffts, (unsigned long)r.frames,
+	       (unsigned long)r.drops, (unsigned long)r.total_len);
 	RPC_RET_FAIL_IF(rc);
 	resp_payload->nfft = req_payload->nfft;
 	resp_payload->freq_hz = req_payload->freq_hz;
@@ -2002,7 +2014,8 @@ static esp_err_t req_sdr_iq_start_handler(Rpc *req, Rpc *resp, void *priv_data)
 		RPC_RET_FAIL_IF(resp_payload->resp);
 	}
 	if (req_payload->dcap != 255) {
-		resp_payload->resp = sdr_set_analog_bw(req_payload->dcap);
+		resp_payload->resp = sdr_set_analog_bw(req_payload->dcap == 254 ?
+				0 : req_payload->dcap);
 		RPC_RET_FAIL_IF(resp_payload->resp);
 	}
 
@@ -2387,6 +2400,13 @@ esp_err_t data_transfer_handler(uint32_t session_id,const uint8_t *inbuf,
 	rpc__init (resp);
 	resp->msg_type = RPC_TYPE__Resp;
 	resp->msg_id = req->msg_id - RPC_ID__Req_Base + RPC_ID__Resp_Base;
+	/* SDR ids are not Req+256: Req_SdrSpec..SdrStop (380..383) map to
+	 * Resp_SdrSpec..SdrStop (680..683) — msg_id doubles as payload_case. */
+	if (req->msg_id >= RPC_ID__Req_SdrSpec &&
+	    req->msg_id <= RPC_ID__Req_SdrStop) {
+		resp->msg_id = req->msg_id - RPC_ID__Req_SdrSpec +
+				RPC_ID__Resp_SdrSpec;
+	}
 	resp->uid = req->uid;
 	resp->payload_case = resp->msg_id;
 	ESP_LOGI(TAG, "Resp_MSGId for req[0x%x] is [0x%x], uid %ld", req->msg_id, resp->msg_id, resp->uid);
