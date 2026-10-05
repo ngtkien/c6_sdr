@@ -122,6 +122,11 @@ static void sd_append(const char *path, const uint8_t *buf, uint32_t len)
 #define TBTN_Y 34
 #define TBTN_W 90
 #define TBTN_H 26
+#define HBTN_X 800   /* HOLD: freeze/pause the chart updates */
+#define CBTN_X 864   /* CLR:  clear max-hold/pano + marker  */
+#define SBTN_Y 34
+#define SBTN_W 58
+#define SBTN_H 26
 
 /* display modes — cycled by the BOOT button (sw0); each owns the full
  * area below the HUD — no split views on a 600 px panel */
@@ -138,7 +143,11 @@ static int dsi_view;
 /* live-trace / panorama state */
 static int tr_top, tr_hgt;
 static bool tr_pano;
+static bool disp_hold;      /* HOLD button: freeze chart updates */
 static uint8_t tr_h[WF_W];
+static uint8_t tr_lv[WF_W]; /* live-dot height per column */
+static int tr_flush;        /* flush-throttle counter */
+static int marker_x = -1;   /* tap-to-tune marker column, -1 off */
 static uint32_t tr_freq;       /* block the SPLIT trace belongs to */
 static uint32_t sw_lo_mhz, sw_hi_mhz, sw_step_mhz;
 
@@ -147,6 +156,7 @@ static char hud_link[96], hud_stat[96], hud_iq[96];
 static uint32_t st_rows, st_drops, st_staged, st_sweep, st_fails;
 static uint32_t st_freq_mhz;
 static bool st_label_pending;
+static uint32_t paint_freq_mhz; /* display-thread's row freq for labels */
 static int label_end_row = -1; /* gutter text occupies [row,row+14) */
 
 /* scroll-rate meter: rows painted per second, EMA over ~1 s window */
@@ -341,6 +351,21 @@ static void hud_draw(void)
 	fb_fill(TBTN_X, TBTN_Y, 1, TBTN_H, 90, 160, 255);
 	fb_fill(TBTN_X + TBTN_W - 1, TBTN_Y, 1, TBTN_H, 90, 160, 255);
 	fb_text(TBTN_X + 8, TBTN_Y + 6, "VIEW>", 2, 160, 220, 255);
+	/* HOLD + CLR buttons */
+	fb_fill(HBTN_X, SBTN_Y, SBTN_W, SBTN_H, disp_hold ? 70 : 20,
+		disp_hold ? 30 : 40, 90);
+	fb_fill(HBTN_X, SBTN_Y, SBTN_W, 1, 90, 160, 255);
+	fb_fill(HBTN_X, SBTN_Y + SBTN_H - 1, SBTN_W, 1, 90, 160, 255);
+	fb_fill(HBTN_X, SBTN_Y, 1, SBTN_H, 90, 160, 255);
+	fb_fill(HBTN_X + SBTN_W - 1, SBTN_Y, 1, SBTN_H, 90, 160, 255);
+	fb_text(HBTN_X + 5, SBTN_Y + 6, "HOLD", 2,
+		disp_hold ? 255 : 160, disp_hold ? 120 : 220, 255);
+	fb_fill(CBTN_X, SBTN_Y, SBTN_W, SBTN_H, 20, 40, 90);
+	fb_fill(CBTN_X, SBTN_Y, SBTN_W, 1, 90, 160, 255);
+	fb_fill(CBTN_X, SBTN_Y + SBTN_H - 1, SBTN_W, 1, 90, 160, 255);
+	fb_fill(CBTN_X, SBTN_Y, 1, SBTN_H, 90, 160, 255);
+	fb_fill(CBTN_X + SBTN_W - 1, SBTN_Y, 1, SBTN_H, 90, 160, 255);
+	fb_text(CBTN_X + 10, SBTN_Y + 6, "CLR", 2, 160, 220, 255);
 	fb_fill(0, WF_TOP - 1, PANEL_W, 1, 40, 40, 60);
 }
 
@@ -392,6 +417,49 @@ static void tr_grow(int c, int hh)
 	tr_h[c] = hh;
 }
 
+/* live-value marker: erase the old dot (restoring whatever was under
+ * it — max-hold color inside the bar, background above) and draw the
+ * new one. Bright white so the live level reads against the max bars. */
+static void tr_live_dot(int c, int hh)
+{
+	int base = tr_top + tr_hgt - 1;
+	uint8_t *px;
+	uint8_t r, g, b;
+
+	if (tr_lv[c] != hh && tr_lv[c] > 0) {
+		px = fb + ((base - tr_lv[c] + 1) * PANEL_W + WF_GUTTER + c) * 3;
+		if (tr_lv[c] <= tr_h[c]) {
+			db_rgb((uint8_t)(tr_lv[c] * 255 / tr_hgt), &r, &g, &b);
+		} else {
+			r = g = 0; b = 8;
+		}
+		px[0] = r; px[1] = g; px[2] = b;
+	}
+	if (hh > 0) {
+		px = fb + ((base - hh + 1) * PANEL_W + WF_GUTTER + c) * 3;
+		px[0] = 255; px[1] = 255; px[2] = 255;
+	}
+	tr_lv[c] = hh;
+}
+
+/* slow decay for the panorama: erase one pixel from the top of each
+ * accumulated bar so old peaks fade instead of pinning at max */
+static void tr_decay(void)
+{
+	int base = tr_top + tr_hgt - 1;
+
+	for (int c = 0; c < WF_W; c++) {
+		uint8_t *px;
+
+		if (!tr_h[c]) {
+			continue;
+		}
+		px = fb + ((base - tr_h[c] + 1) * PANEL_W + WF_GUTTER + c) * 3;
+		px[0] = 0; px[1] = 0; px[2] = 8;
+		tr_h[c]--;
+	}
+}
+
 /* eSpDR-style spectrum trace.
  * SPLIT: max-hold bar chart of the current block's nfft bins.
  * PANO:  each bin lands on the sweep-frequency axis (80 MHz span per
@@ -406,6 +474,7 @@ static void dsi_trace(const uint8_t *bins, uint32_t nfft, uint32_t freq_hz)
 		if (freq_hz != tr_freq) {
 			tr_freq = freq_hz;
 			memset(tr_h, 0, sizeof(tr_h));
+			memset(tr_lv, 0, sizeof(tr_lv));
 			fb_fill(WF_GUTTER, tr_top, WF_W, tr_hgt, 0, 0, 8);
 		}
 		for (int c = 0; c < WF_W; c++) {
@@ -415,12 +484,14 @@ static void dsi_trace(const uint8_t *bins, uint32_t nfft, uint32_t freq_hz)
 			if (hh > tr_h[c]) {
 				tr_grow(c, hh);
 			}
+			tr_live_dot(c, hh);
 		}
 	} else {
 		/* panorama: bin frequency = tune + (b - nfft/2) * 80MHz/nfft */
 		uint32_t lo_hz = (sw_lo_mhz - 40) * 1000000u;
 		uint32_t span_hz = (sw_hi_mhz - sw_lo_mhz + 80) * 1000000u;
 		int64_t bin_hz = 80000000ll / nfft;
+		static int dec;
 
 		for (uint32_t b = 0; b < nfft; b++) {
 			int64_t fbq = (int64_t)freq_hz +
@@ -435,10 +506,21 @@ static void dsi_trace(const uint8_t *bins, uint32_t nfft, uint32_t freq_hz)
 			if (hh > tr_h[px]) {
 				tr_grow(px, hh);
 			}
+			tr_live_dot(px, hh);
+		}
+		if (++dec >= 20) { /* ~1px every 170ms at 120f/s */
+			dec = 0;
+			tr_decay();
 		}
 	}
-	sys_cache_data_flush_range(fb + tr_top * PANEL_W * 3,
-				   tr_hgt * PANEL_W * 3);
+	/* the region flush is ~1.6MB of cache writeback — at ~176 f/s that
+	 * dominates the frame cost. The scanout only refreshes at ~56 Hz,
+	 * so flushing every 4th frame loses nothing on screen. */
+	if (++tr_flush >= 4) {
+		tr_flush = 0;
+		sys_cache_data_flush_range(fb + tr_top * PANEL_W * 3,
+					   tr_hgt * PANEL_W * 3);
+	}
 }
 
 /* freq grid for the panorama: vertical line + label every sweep step */
@@ -464,6 +546,7 @@ static void dsi_view_apply(int v)
 {
 	dsi_view = v;
 	memset(tr_h, 0, sizeof(tr_h));
+	memset(tr_lv, 0, sizeof(tr_lv));
 	tr_freq = 0;
 	label_end_row = -1;
 	if (v == VIEW_SPEC) {
@@ -490,6 +573,11 @@ static void dsi_view_apply(int v)
 			fb_fill(WF_GUTTER, base - tr_hgt * i / 4, WF_W, 1,
 				30, 30, 50);
 		}
+		/* relative level tags in the free left gutter (bins are
+		 * ~log codes 0-255; quarters ≈ 25% of scale each) */
+		fb_text(8, base - tr_hgt / 4 - 9, "75%", 1, 90, 90, 120);
+		fb_text(8, base - tr_hgt / 2 - 9, "50%", 1, 90, 90, 120);
+		fb_text(8, base - tr_hgt * 3 / 4 - 9, "25%", 1, 90, 90, 120);
 		if (tr_pano) {
 			pano_grid();
 		}
@@ -500,8 +588,10 @@ static void dsi_view_apply(int v)
 				   (PANEL_H - WF_TOP) * PANEL_W * 3);
 }
 
-/* touch-button rect inside the HUD (drawn by hud_draw) */
+/* touch-button rects inside the HUD (drawn by hud_draw) */
 static volatile bool touch_req;
+static volatile bool hold_req, clr_req;
+static volatile int tap_x = -1, tap_y;
 
 /* GT911 touch via Zephyr input: track position, flag presses inside the
  * on-screen button — dsi_view_apply runs on the app thread instead. */
@@ -521,10 +611,55 @@ static void touch_cb(struct input_event *evt, void *user_data)
 		if (tx >= TBTN_X && tx < TBTN_X + TBTN_W &&
 		    ty >= TBTN_Y && ty < TBTN_Y + TBTN_H) {
 			touch_req = true;
+		} else if (tx >= HBTN_X && tx < HBTN_X + SBTN_W &&
+			   ty >= SBTN_Y && ty < SBTN_Y + SBTN_H) {
+			hold_req = true;
+		} else if (tx >= CBTN_X && tx < CBTN_X + SBTN_W &&
+			   ty >= SBTN_Y && ty < SBTN_Y + SBTN_H) {
+			clr_req = true;
+		} else if (ty >= WF_TOP && tx >= WF_GUTTER) {
+			tap_x = tx - WF_GUTTER;
+			tap_y = ty;
 		}
 	}
 }
 INPUT_CALLBACK_DEFINE(NULL, touch_cb, NULL);
+
+/* marker: MHz*10 at the tapped column for the active view */
+static uint32_t marker_mhz10(void)
+{
+	if (tr_pano) {
+		uint32_t lo = (sw_lo_mhz - 40) * 10u;
+		uint32_t span = (sw_hi_mhz - sw_lo_mhz + 80) * 10u;
+
+		return lo + (uint32_t)marker_x * span / WF_W;
+	}
+	/* SPEC / WFL: columns span 80 MHz around the current tune freq */
+	return (uint32_t)((int32_t)st_freq_mhz * 10 +
+	       ((int64_t)marker_x - WF_W / 2) * 800 / WF_W);
+}
+
+static void marker_draw(void)
+{
+	int top = tr_hgt ? tr_top : wf_top;
+	uint8_t *px;
+	char lab[16];
+
+	if (marker_x < 0 || top >= PANEL_H) {
+		return;
+	}
+	px = fb + (top * PANEL_W + WF_GUTTER + marker_x) * 3;
+	for (int y = top; y < PANEL_H; y++) {
+		px[0] = 200; px[1] = 40; px[2] = 255;
+		px += PANEL_W * 3;
+	}
+	if (tr_hgt) { /* freq label: only where it won't scroll away */
+		snprintf(lab, sizeof(lab), "%u.%uM",
+			 marker_mhz10() / 10, marker_mhz10() % 10);
+		fb_text(WF_GUTTER + marker_x + 3, top + 2, lab, 1,
+			255, 160, 255);
+	}
+}
 
 /* BOOT button edge-detect; call frequently from the frame path */
 static const struct gpio_dt_spec boot_btn =
@@ -540,6 +675,24 @@ static void view_button_poll(void)
 		touch_req = false;
 		dsi_view_apply((dsi_view + 1) % VIEW_N);
 		printk("view: %s (touch)\n", view_name());
+	}
+	if (hold_req) { /* HOLD: freeze chart, HUD + stats keep running */
+		hold_req = false;
+		disp_hold = !disp_hold;
+		printk("hold: %s\n", disp_hold ? "on" : "off");
+		dsi_hud();
+	}
+	if (clr_req) { /* CLR: wipe accumulated trace + marker */
+		clr_req = false;
+		marker_x = -1;
+		dsi_view_apply(dsi_view);
+	}
+	if (tap_x >= 0) { /* tap-to-tune marker on the chart */
+		marker_x = tap_x < WF_W ? tap_x : WF_W - 1;
+		tap_x = -1;
+		marker_draw();
+		printk("marker: %u.%u MHz\n",
+		       marker_mhz10() / 10, marker_mhz10() % 10);
 	}
 	if (!boot_btn.port) {
 		return;
@@ -576,7 +729,7 @@ static void dsi_spec_row(const uint8_t *bins, uint32_t nfft)
 	if (st_label_pending) {
 		char lab[8];
 
-		snprintf(lab, sizeof(lab), "%u", st_freq_mhz);
+		snprintf(lab, sizeof(lab), "%u", paint_freq_mhz);
 		memset(row, 0, WF_GUTTER * 3);
 		/* clear the rows the 14px-tall label will occupy */
 		for (int i = 1; i < 14 && wf_row + i < PANEL_H; i++) {
@@ -616,6 +769,47 @@ static void dsi_spec_row(const uint8_t *bins, uint32_t nfft)
 /* ---------- row output: console ASCII and/or DSI ---------- */
 static const char ascii[] = " .:-=+*#%@";
 
+/* display worker: the pull path just enqueues rows; painting (db_rgb,
+ * memmove scrolls, cache flushes) runs here so a slow frame can't
+ * throttle the RPC drain. Queue-full rows are counted, not dropped
+ * silently. */
+#define DISP_MAX_NFFT 256
+struct disp_row {
+	uint32_t freq;
+	uint32_t nfft;
+	uint8_t  drops;
+	uint8_t  bins[DISP_MAX_NFFT];
+};
+K_MSGQ_DEFINE(disp_q, sizeof(struct disp_row), 24, 4);
+static uint32_t disp_drops;
+
+static void disp_thread(void *a, void *b, void *c)
+{
+	struct disp_row r;
+	uint32_t lab_freq = 0;
+
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	for (;;) {
+		if (k_msgq_get(&disp_q, &r, K_MSEC(250))) {
+			view_button_poll();
+			continue;
+		}
+		if (disp_hold) {
+			continue;
+		}
+		if (r.freq != lab_freq) {
+			lab_freq = r.freq;
+			paint_freq_mhz = r.freq / 1000000;
+			st_label_pending = true;
+		}
+		dsi_trace(r.bins, r.nfft, r.freq);
+		dsi_spec_row(r.bins, r.nfft);
+		marker_draw();
+	}
+}
+K_THREAD_DEFINE(disp_th, 4096, disp_thread, NULL, NULL, NULL,
+		K_PRIO_COOP(9), 0, 0);
+
 static bool sdr_row_cb(const struct sdr_spc1 *h, const uint8_t *bins,
 		       void *arg)
 {
@@ -639,10 +833,15 @@ static bool sdr_row_cb(const struct sdr_spc1 *h, const uint8_t *bins,
 	st_drops += h->drops;
 	fps_rows++;
 	fps_tick();
-	if (dsi_ok) {
-		view_button_poll();
-		dsi_trace(bins, nfft, freq);
-		dsi_spec_row(bins, nfft);
+	if (dsi_ok && nfft <= DISP_MAX_NFFT) {
+		struct disp_row r = {
+			.freq = freq, .nfft = nfft, .drops = h->drops,
+		};
+
+		memcpy(r.bins, bins, nfft);
+		if (k_msgq_put(&disp_q, &r, K_NO_WAIT)) {
+			disp_drops++;
+		}
 	}
 	return true;
 }

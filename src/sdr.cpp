@@ -197,16 +197,26 @@ int sdr_spec_stream(uint32_t freq_hz, uint16_t nfft, uint8_t stride,
 		return -EIO;
 	}
 	*out_bytes = 0;
+	uint64_t t_data = 0, t_again = 0;
+	uint32_t n_data = 0, n_again = 0;
 	for (;;) {
 		uint32_t got = 0, total = 0, roff = 0;
+		uint32_t c0 = k_cycle_get_32();
 
 		ret = esp_ng_sdr_iq_read(consumed, acc + fill,
 					 sizeof(acc) - fill,
 					 &got, &total, &roff);
+		uint32_t us = k_cyc_to_us_floor32(k_cycle_get_32() - c0);
 		if (ret == -ENOENT) {
+			printk("rd: %u data %u.%ums avg | %u again %u.%ums avg\n",
+			       n_data, (uint32_t)(t_data / (n_data ?: 1) / 10),
+			       (uint32_t)(t_data / (n_data ?: 1) % 10),
+			       n_again, (uint32_t)(t_again / (n_again ?: 1) / 10),
+			       (uint32_t)(t_again / (n_again ?: 1) % 10));
 			break; /* run over, ring drained */
 		}
 		if (ret == -EAGAIN) {
+			t_again += us; n_again++;
 			if (++idle > 300) {
 				break; /* run died silently */
 			}
@@ -217,6 +227,7 @@ int sdr_spec_stream(uint32_t freq_hz, uint16_t nfft, uint8_t stride,
 			esp_ng_sdr_stop();
 			return ret;
 		}
+		t_data += us; n_data++;
 		idle = 0;
 		if (roff != consumed) {
 			consumed = roff; /* overrun gap — drop partial record */
