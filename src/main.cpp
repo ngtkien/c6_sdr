@@ -126,6 +126,10 @@ static void sd_append(const char *path, const uint8_t *buf, uint32_t len)
 #define TBTN_H 26
 #define HBTN_X 800   /* HOLD: freeze/pause the chart updates */
 #define CBTN_X 864   /* CLR:  clear max-hold/pano + marker  */
+#define FBTN_X 940   /* FRQ:  IQ page freq-lock button (drawn in page) */
+#define FBTN_Y 552
+#define FBTN_W 80
+#define FBTN_H 26
 #define SBTN_Y 34
 #define SBTN_W 58
 #define SBTN_H 26
@@ -529,43 +533,199 @@ static void dsi_trace(const uint8_t *bins, uint32_t nfft, uint32_t freq_hz)
 	}
 }
 
-/* ---------- IQ scope: constellation of the latest iq8 burst ---------- */
-#define IQ_SCOPE_PTS 4096          /* iq8 pairs per burst            */
-#define IQ_SCOPE_SCALE 2           /* px per LSB                     */
-static int8_t iq_pts[2 * IQ_SCOPE_PTS];
+/* ---------- IQ page: phosphor constellation + I/Q waveforms ----------
+ * Burst iq8 pairs land in iq_pts; the phosphor map accumulates each
+ * burst with 7/8 decay so signal structure persists like a CRT.
+ * Auto-scale tracks a smoothed peak; DC offset is removed for display
+ * and reported in the stats line. */
+#define IQ_PTS_CAP 16384           /* iq8 pairs kept per burst        */
+#define SC_W 512
+#define SC_H 512
+#define SC_X 24
+#define SC_Y (WF_TOP + 12)
+#define WV_X 560                   /* I/Q waveform strips             */
+#define WV_W 440
+#define WI_Y (SC_Y)
+#define WI_H 200
+#define WQ_Y (SC_Y + 232)
+#define WQ_H 200
+static int8_t iq_pts[2 * IQ_PTS_CAP];
+static uint32_t iq_npairs;
+static uint8_t iq_den[SC_W * SC_H] __attribute__((section(".ext_ram.bss")));
 static volatile uint32_t iq_seq, iq_seen;
+static uint32_t iq_peak = 128;     /* smoothed peak |LSB| for scale   */
+static int iq_mean_i, iq_mean_q;
+static bool iq_lock;               /* FRQ button: park on one freq    */
+static uint32_t iq_lock_hz;
+
+static void iq_circle(int cx, int cy, int r, uint8_t cr, uint8_t cg,
+		      uint8_t cb)
+{
+	/* midpoint circle, 8 symmetric dots per step */
+	for (int x = 0, y = r, d = 1 - r; x <= y;) {
+		static const int8_t sx[8] = {1, -1, 1, -1, 1, -1, 1, -1};
+		static const int8_t sy[8] = {1, 1, -1, -1, 1, 1, -1, -1};
+		static const bool sw[8] = {0, 0, 0, 0, 1, 1, 1, 1};
+
+		for (int i = 0; i < 8; i++) {
+			int px = cx + (sw[i] ? y : x) * sx[i];
+			int py = cy + (sw[i] ? x : y) * sy[i];
+
+			if ((unsigned)(px - SC_X) < SC_W &&
+			    (unsigned)(py - SC_Y) < SC_H) {
+				uint8_t *p = fb + (py * PANEL_W + px) * 3;
+
+				p[0] = cr; p[1] = cg; p[2] = cb;
+			}
+		}
+		if (d < 0) {
+			d += 2 * x + 3;
+		} else {
+			d += 2 * (x - y) + 5;
+			y--;
+		}
+		x++;
+	}
+}
+
+/* one waveform strip: first np pairs decimated to WV_W columns */
+static void iq_wave(int x0, int y0, int w, int h, int which, int peak,
+		   uint8_t cr, uint8_t cg, uint8_t cb, const char *tag)
+{
+	int mid = y0 + h / 2;
+	uint32_t n = iq_npairs ? iq_npairs : 1;
+
+	fb_fill(x0, y0, w, h, 4, 4, 12);
+	fb_fill(x0, mid, w, 1, 50, 50, 70);
+	fb_text(x0 + 4, y0 + 4, tag, 1, cr / 2, cg / 2, cb / 2);
+	for (int c = 0; c < w; c++) {
+		uint32_t k = (uint32_t)c * n / w;
+		int v = iq_pts[2 * k + which];
+		int y = mid - v * (h / 2 - 8) / (peak ? (int)peak : 1);
+		uint8_t *p;
+
+		if (y < y0 + 2) {
+			y = y0 + 2;
+		} else if (y > y0 + h - 3) {
+			y = y0 + h - 3;
+		}
+		p = fb + (y * PANEL_W + x0 + c) * 3;
+		p[0] = cr; p[1] = cg; p[2] = cb;
+	}
+}
 
 static void dsi_scope(void)
 {
-	int cx = PANEL_W / 2, cy = (WF_TOP + PANEL_H) / 2;
+	int cx = SC_X + SC_W / 2, cy = SC_Y + SC_H / 2;
+	uint32_t n = iq_npairs;
+	int pk = 8;
+	int64_t isum = 0, qsum = 0;
 	uint8_t *p;
+	char lab[40];
 
-	if (iq_seen == iq_seq) {
+	if (iq_seen == iq_seq || !n) {
 		return;
 	}
 	iq_seen = iq_seq;
-	fb_fill(0, WF_TOP, PANEL_W, PANEL_H - WF_TOP, 0, 0, 8);
-	/* axes */
-	fb_fill(cx - 256, cy, 512, 1, 60, 60, 80);
-	fb_fill(cx, cy - 256, 1, 512, 60, 60, 80);
-	/* unit circle guide: square frame at +-128 LSB */
-	for (int i = -256; i <= 256; i += 4) {
-		p = fb + ((cy - 256) * PANEL_W + cx + i) * 3;
-		p[0] = 50; p[1] = 50; p[2] = 70;
-		p = fb + ((cy + 256) * PANEL_W + cx + i) * 3;
-		p[0] = 50; p[1] = 50; p[2] = 70;
-		p = fb + ((cy + i) * PANEL_W + cx - 256) * 3;
-		p[0] = 50; p[1] = 50; p[2] = 70;
-		p = fb + ((cy + i) * PANEL_W + cx + 256) * 3;
-		p[0] = 50; p[1] = 50; p[2] = 70;
-	}
-	for (int i = 0; i < IQ_SCOPE_PTS; i++) {
-		int x = cx + iq_pts[i * 2] * IQ_SCOPE_SCALE;
-		int y = cy - iq_pts[i * 2 + 1] * IQ_SCOPE_SCALE;
 
-		p = fb + (y * PANEL_W + x) * 3;
-		p[0] = 80; p[1] = 255; p[2] = 200;
+	/* burst stats → DC + smoothed autoscale peak */
+	for (uint32_t i = 0; i < n; i++) {
+		int vi = iq_pts[i * 2], vq = iq_pts[i * 2 + 1];
+
+		isum += vi; qsum += vq;
+		if (vi < 0) {
+			vi = -vi;
+		}
+		if (vq < 0) {
+			vq = -vq;
+		}
+		if (vi > pk) {
+			pk = vi;
+		}
+		if (vq > pk) {
+			pk = vq;
+		}
 	}
+	iq_mean_i = (int)(isum / n);
+	iq_mean_q = (int)(qsum / n);
+	iq_peak = MAX((uint32_t)pk, (iq_peak * 15) >> 4);
+	int scale = (SC_W / 2 - 24) * 256 / (int)iq_peak; /* Q8 px/LSB */
+
+	/* phosphor decay, then accumulate the burst */
+	for (int i = 0; i < SC_W * SC_H; i++) {
+		iq_den[i] = (uint8_t)((iq_den[i] * 7) >> 3);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		int x = cx + (((iq_pts[i * 2] - iq_mean_i) * scale) >> 8);
+		int y = cy - (((iq_pts[i * 2 + 1] - iq_mean_q) * scale) >> 8);
+
+		if ((unsigned)(x - SC_X) < SC_W && (unsigned)(y - SC_Y) < SC_H) {
+			uint8_t *d = &iq_den[(y - SC_Y) * SC_W + (x - SC_X)];
+
+			*d = *d > 223 ? 255 : *d + 32;
+		}
+	}
+
+	/* render phosphor → fb through the heat ramp */
+	for (int yy = 0; yy < SC_H; yy++) {
+		const uint8_t *d = &iq_den[yy * SC_W];
+
+		p = fb + ((SC_Y + yy) * PANEL_W + SC_X) * 3;
+		for (int xx = 0; xx < SC_W; xx++) {
+			uint8_t v = d[xx];
+
+			if (v) {
+				db_rgb(v, &p[0], &p[1], &p[2]);
+			} else {
+				p[0] = 0; p[1] = 0; p[2] = 8;
+			}
+			p += 3;
+		}
+	}
+	/* reticle: cross + three radius guides */
+	fb_fill(cx - SC_W / 2 + 4, cy, SC_W - 8, 1, 45, 45, 65);
+	fb_fill(cx, cy - SC_H / 2 + 4, 1, SC_H - 8, 45, 45, 65);
+	iq_circle(cx, cy, SC_W / 6, 40, 40, 55);
+	iq_circle(cx, cy, SC_W / 3, 40, 40, 55);
+	iq_circle(cx, cy, SC_W / 2 - 8, 55, 55, 75);
+	/* DC position marker (LO leakage) — small magenta cross */
+	{
+		int mx = cx - (iq_mean_i * scale >> 8);
+		int my = cy + (iq_mean_q * scale >> 8);
+
+		if ((unsigned)(mx - SC_X) < SC_W &&
+		    (unsigned)(my - SC_Y) < SC_H) {
+			fb_fill(mx - 4, my, 9, 1, 255, 60, 200);
+			fb_fill(mx, my - 4, 1, 9, 255, 60, 200);
+		}
+	}
+	/* scale + stats */
+	snprintf(lab, sizeof(lab), "+-%u LSB", iq_peak);
+	fb_text(SC_X + 6, SC_Y + SC_H - 14, lab, 1, 140, 140, 180);
+	snprintf(lab, sizeof(lab), "I u%d  Q u%d%s", iq_mean_i, iq_mean_q,
+		 iq_lock ? "  FRQ" : "");
+	fb_text(SC_X + 6, SC_Y + 6, lab, 1, 140, 140, 180);
+
+	/* right column: I(t) and Q(t) strips + stats block */
+	iq_wave(WV_X, WI_Y, WV_W, WI_H, 0, iq_peak, 80, 220, 140, "I(t)");
+	iq_wave(WV_X, WQ_Y, WV_W, WQ_H, 1, iq_peak, 255, 180, 60, "Q(t)");
+	snprintf(lab, sizeof(lab), "F %u.%u MHz%s  %lu pairs",
+		 iq_lock ? iq_lock_hz / 1000000 : st_freq_mhz,
+		 iq_lock ? (iq_lock_hz / 100000) % 10 : 0,
+		 iq_lock ? " LOCK" : "",
+		 (unsigned long)iq_npairs);
+	fb_text(WV_X + 4, WQ_Y + WQ_H + 16, lab, 1, 120, 120, 160);
+
+	/* FRQ lock button (IQ page only) */
+	fb_fill(FBTN_X, FBTN_Y, FBTN_W, FBTN_H,
+		iq_lock ? 90 : 20, iq_lock ? 50 : 40, 90);
+	fb_fill(FBTN_X, FBTN_Y, FBTN_W, 1, 90, 160, 255);
+	fb_fill(FBTN_X, FBTN_Y + FBTN_H - 1, FBTN_W, 1, 90, 160, 255);
+	fb_fill(FBTN_X, FBTN_Y, 1, FBTN_H, 90, 160, 255);
+	fb_fill(FBTN_X + FBTN_W - 1, FBTN_Y, 1, FBTN_H, 90, 160, 255);
+	fb_text(FBTN_X + 8, FBTN_Y + 6, iq_lock ? "FRQ*" : "FRQ", 2,
+		iq_lock ? 255 : 160, iq_lock ? 200 : 220, 255);
+
 	sys_cache_data_flush_range(fb + WF_TOP * PANEL_W * 3,
 				   (PANEL_H - WF_TOP) * PANEL_W * 3);
 }
@@ -631,6 +791,8 @@ static void dsi_view_apply(int v)
 	} else if (v == VIEW_IQ) {
 		tr_top = tr_hgt = 0;
 		wf_top = PANEL_H; /* scope owns the frame */
+		memset(iq_den, 0, sizeof(iq_den));
+		iq_peak = 128;
 	} else {
 		tr_top = 0;
 		tr_hgt = 0;
@@ -662,7 +824,7 @@ static void dsi_view_apply(int v)
 
 /* touch-button rects inside the HUD (drawn by hud_draw) */
 static volatile bool touch_req;
-static volatile bool hold_req, clr_req;
+static volatile bool hold_req, clr_req, frq_req;
 static volatile int tap_x = -1, tap_y;
 
 /* GT911 touch via Zephyr input: track position, flag presses inside the
@@ -689,7 +851,12 @@ static void touch_cb(struct input_event *evt, void *user_data)
 		} else if (tx >= CBTN_X && tx < CBTN_X + SBTN_W &&
 			   ty >= SBTN_Y && ty < SBTN_Y + SBTN_H) {
 			clr_req = true;
-		} else if (ty >= WF_TOP && tx >= WF_GUTTER) {
+		} else if (dsi_view == VIEW_IQ &&
+			   tx >= FBTN_X && tx < FBTN_X + FBTN_W &&
+			   ty >= FBTN_Y && ty < FBTN_Y + FBTN_H) {
+			frq_req = true;
+		} else if (ty >= WF_TOP && tx >= WF_GUTTER &&
+			   dsi_view != VIEW_IQ) {
 			tap_x = tx - WF_GUTTER;
 			tap_y = ty;
 		}
@@ -758,6 +925,18 @@ static void view_button_poll(void)
 		clr_req = false;
 		marker_x = -1;
 		dsi_view_apply(dsi_view);
+	}
+	if (frq_req) { /* IQ page: lock bursts to one freq */
+		frq_req = false;
+		iq_lock = !iq_lock;
+		if (iq_lock) {
+			iq_lock_hz = marker_x >= 0 ?
+				marker_mhz10() * 100000u :
+				st_freq_mhz * 1000000u;
+		}
+		printk("iq lock: %s %u.%u MHz\n", iq_lock ? "on" : "off",
+		       iq_lock_hz / 1000000, (iq_lock_hz / 100000) % 10);
+		iq_seq++; /* force a scope repaint for the button state */
 	}
 	if (tap_x >= 0) { /* tap-to-tune marker on the chart */
 		marker_x = tap_x < WF_W ? tap_x : WF_W - 1;
@@ -888,7 +1067,8 @@ static void scope_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	for (;;) {
-		if (dsi_ok && dsi_view == VIEW_IQ && iq_seen != iq_seq) {
+		if (dsi_ok && dsi_view == VIEW_IQ && !disp_hold &&
+		    iq_seen != iq_seq) {
 			dsi_scope();
 		}
 		k_msleep(20);
@@ -1117,8 +1297,11 @@ int main(void)
 				struct esp_ng_sdr_run_res ires;
 				uint32_t ilen = 0;
 
-				ret = sdr_iq_burst_pull(f * 1000000u,
-							IQ_SCOPE_PTS, 16, gain,
+				ret = sdr_iq_burst_pull(
+							iq_lock ? iq_lock_hz
+								: f * 1000000u,
+							IQ_PTS_CAP / 4, 16,
+							gain,
 							ESP_NG_SDR_DCAP_AUTO,
 							cap_buf, CAP_MAX,
 							&ilen, &ires);
@@ -1134,8 +1317,9 @@ int main(void)
 				}
 				if (!ret && ilen >= 8 && !ires.status) {
 					uint32_t n = MIN(ilen / 2,
-							 IQ_SCOPE_PTS);
+							 IQ_PTS_CAP);
 					memcpy(iq_pts, cap_buf, n * 2);
+					iq_npairs = n;
 					iq_seq++;
 					iq_blip(iq_pts, n);
 					total += ilen;
