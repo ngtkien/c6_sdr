@@ -1960,6 +1960,60 @@ static esp_err_t sdr_ensure_radio(void)
  * post-streaming DMA headroom (~6 KB lfb) */
 #define SDR_MAX_READ_CHUNK 1400u
 
+/* factory CW-tone state (SdrIqStart mode 2/3) */
+static bool rf_tone_on;
+
+/* CW tone replicated from librftest wifiscwout(), which drags ~45 KiB
+ * of BSS (mac_common txbuffer) into the RF-dump SRAM window when linked.
+ * All pieces below are already in the link or in ROM. */
+extern void **g_phyFuns;            /* ROM PHY function table */
+extern uint8_t phy_param[];         /* RF param table */
+extern uint8_t phy_tx_pwr_track_en, phy_tx_pwr_correct_en;
+extern int  RFChannelSel(uint8_t chan, int8_t mode);
+extern int  rfpll_cap_correct_new(uint8_t cap);
+extern void tx_pwctrl_background(uint8_t en, int arg);
+extern void bt_track_pll_cap(void);
+extern void txcal_work_mode(void);  /* ROM: tone-off cleanup */
+extern void ets_delay_us(uint32_t us);
+
+#define PHYFUN_TXCAL_DBG   37       /* rom_txcal_debuge_mode */
+#define PHYFUN_TONE_STEP   38       /* rom_start_tx_tone_step */
+#define PHYFUN_CHAN_CAL    2        /* rom_set_chan_cal_interp */
+
+static void rf_chan_set(uint8_t chan)
+{
+	RFChannelSel(chan, 0);
+	if (phy_param[10]) {
+		for (int s = 10; s; s--) {
+			ets_delay_us(20);
+			if (!rfpll_cap_correct_new(phy_param[9]))
+				break;
+		}
+	}
+	if (phy_tx_pwr_track_en) {
+		tx_pwctrl_background(phy_tx_pwr_correct_en, 0);
+		bt_track_pll_cap();
+	}
+}
+
+static void rf_tone_set(uint8_t chan, uint32_t backoff, bool on)
+{
+	typedef void (*tone_fn)(int, int, int, int, int, int);
+	if (!on) {
+		((tone_fn)g_phyFuns[PHYFUN_TONE_STEP])(0, 0, 0, 0, 0, 0);
+		txcal_work_mode();
+		return;
+	}
+	rf_chan_set(chan);
+	((void (*)(int))g_phyFuns[PHYFUN_TXCAL_DBG])(0);
+	int base = ((int (*)(uint8_t *, int))g_phyFuns[PHYFUN_CHAN_CAL])
+			(phy_param + 0xf4, chan);
+	int pwr = (int)(int8_t)(base + backoff + 12);
+	if (pwr < 0)
+		pwr = 0;
+	((tone_fn)g_phyFuns[PHYFUN_TONE_STEP])(1, 0, pwr & 0xff, 0, 0, 0);
+}
+
 static esp_err_t req_sdr_spec_handler(Rpc *req, Rpc *resp, void *priv_data)
 {
 	RPC_TEMPLATE(RpcRespSdrSpec, resp_sdr_spec,
@@ -2004,6 +2058,23 @@ static esp_err_t req_sdr_iq_start_handler(Rpc *req, Rpc *resp, void *priv_data)
 			rpc__resp__sdr_iq_start__init);
 
 	RPC_RET_FAIL_IF(sdr_ensure_radio());
+	if (req_payload->mode == 2 || req_payload->mode == 3) {
+		/* mode 2/3: factory CW tone — emits real RF on TX! */
+		uint32_t chan = req_payload->freq_hz >= 2407000000u ?
+			(req_payload->freq_hz - 2407000000u) / 5000000u : 6;
+		chan = chan < 1 ? 1 : chan > 14 ? 14 : chan;
+		uint32_t bkoff = req_payload->gain <= 88 ? req_payload->gain : 0;
+		if (req_payload->mode == 2 && !rf_tone_on) {
+			rf_tone_set(chan, bkoff, true);
+			rf_tone_on = true;
+		} else if (req_payload->mode == 3 && rf_tone_on) {
+			rf_tone_set(chan, 0, false);
+			rf_tone_on = false;
+		}
+		resp_payload->pairs = chan;
+		resp_payload->detail = rf_tone_on ? 1 : 0;
+		return ESP_OK;
+	}
 	if (req_payload->gain != 256) {
 		resp_payload->resp = sdr_set_gain(req_payload->gain == 255 ?
 				-1 : (int)req_payload->gain);
@@ -2090,6 +2161,10 @@ static esp_err_t req_sdr_stop_handler(Rpc *req, Rpc *resp, void *priv_data)
 			RpcReqSdrStop, req_sdr_stop,
 			rpc__resp__sdr_stop__init);
 	sdr_stop();
+	if (rf_tone_on) {		/* failsafe: SdrStop kills CW tone */
+		rf_tone_set(6, 0, false);
+		rf_tone_on = false;
+	}
 	return ESP_OK;
 }
 

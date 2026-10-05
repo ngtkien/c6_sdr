@@ -98,6 +98,21 @@ int sdr_iq_burst_pull(uint32_t freq_hz, uint16_t n_pairs, uint8_t fmt,
 	return sdr_pull_all(res->total_len, buf, buf_cap, out_len);
 }
 
+/* Factory RF-test CW tone — emits real RF on the C6's TX chain.
+ * backoff_qdb: 0.25 dB attenuation units (0 = full power). On return,
+ * res->pairs echoes the Wi-Fi channel used, res->detail = 1 when on. */
+int sdr_tone(uint32_t freq_hz, bool on, uint32_t backoff_qdb,
+	     struct esp_ng_sdr_run_res *res)
+{
+	struct esp_ng_sdr_iq_req req = {
+		.freq_hz = freq_hz,
+		.mode = on ? 2 : 3,
+		.gain = backoff_qdb,
+		.dcap = ESP_NG_SDR_DCAP_KEEP,
+	};
+	return esp_ng_sdr_iq_start(&req, res);
+}
+
 /* Consume complete SPC1/SPS1 records from the front of buf; returns
  * bytes consumed (a partial trailing record stays for the next chunk).
  * Sets *halt if cb vetoes the stream. */

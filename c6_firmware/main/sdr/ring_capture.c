@@ -1526,7 +1526,7 @@ RING_HOT void ring_capture_run(const ring_config_t *cfg, ring_result_t *r) {
     REG_WRITE(DUMP_CTRL_REG, ctrl|(1u<<18));
 #endif
     REG_WRITE(DUMP_CTRL_REG, ctrl);
-    select_banks(bank_sel_saved,1u);
+    select_banks(bank_sel_saved,1u << RING_BANK_HW_OFF);
     int64_t t_start = esp_timer_get_time();
     st.last_ok = t_start;
     REG_WRITE(DUMP_CTRL_REG, ctrl | DUMP_CTRL_RUN);
@@ -1692,7 +1692,7 @@ RING_HOT void ring_capture_run(const ring_config_t *cfg, ring_result_t *r) {
             REG_WRITE(DUMP_CTRL_REG, ctrl);
             select_banks(bank_sel_saved,0u);
         } else {
-            select_banks(bank_sel_saved,1u << next);
+            select_banks(bank_sel_saved,1u << (next + RING_BANK_HW_OFF));
             epoch = esp_cpu_get_cycle_count();
         }
         uint32_t t = esp_cpu_get_cycle_count();

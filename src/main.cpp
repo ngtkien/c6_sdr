@@ -133,6 +133,8 @@ static void sd_append(const char *path, const uint8_t *buf, uint32_t len)
 }
 
 static volatile bool cap_req;
+static volatile bool tone_req;
+static bool tone_on;
 static volatile bool cap_busy;   /* sweep loop idles while a dump runs */
 
 /* ---------- DSI waterfall + HUD ---------- */
@@ -1045,6 +1047,8 @@ static void dsi_view_apply(int v)
 static volatile bool touch_req;
 static volatile bool hold_req, clr_req, frq_req;
 static volatile int tap_x = -1, tap_y;
+static bool touch_ready;   /* gt911 bound; false -> keep retrying init */
+static uint32_t tick;      /* scope_thread tick count */
 
 /* GT911 touch via Zephyr input: track position, flag presses inside the
  * on-screen button — dsi_view_apply runs on the app thread instead. */
@@ -1295,13 +1299,16 @@ static void scope_thread(void *a, void *b, void *c)
 
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	for (;;) {
-		/* console remote: 'v' cycles view, 'c' captures screen */
+		/* console remote: 'v' cycles view, 'c' captures screen,
+		 * 't' toggles the C6's factory CW test tone (emits RF) */
 		if (con && device_is_ready(con)) {
 			while (uart_poll_in(con, &ch) == 0) {
 				if (ch == 'v' || ch == 'V') {
 					touch_req = true;
 				} else if (ch == 'c' || ch == 'C') {
 					cap_req = true;
+				} else if (ch == 't' || ch == 'T') {
+					tone_req = true;
 				}
 			}
 		}
@@ -1309,11 +1316,51 @@ static void scope_thread(void *a, void *b, void *c)
 			cap_req = false;
 			cap_dump();
 		}
+		if (tone_req) {
+			struct esp_ng_sdr_run_res tres;
+			uint32_t thz = marker_x >= 0 ? marker_mhz10() * 100000u
+						     : st_freq_mhz * 1000000u;
+			int trc;
+
+			tone_req = false;
+			tone_on = !tone_on;
+			trc = sdr_tone(thz, tone_on, 40 /* 10 dB atten */, &tres);
+			printk("tone: %s %u.%03u MHz rc=%d ch=%u on=%u\n",
+			       tone_on ? "ON" : "off",
+			       thz / 1000000, (thz / 1000) % 1000, trc,
+			       (unsigned)tres.pairs, (unsigned)tres.detail);
+		}
+		/* GT911 lives on the LCD sub-board and can wake later than the
+		 * SoC; if its boot-time probe NAK'd, retry the init here until
+		 * it binds (device_init reruns a failed init). */
+		if (!touch_ready && (tick & 0x1ff) == 0) {
+			static const struct device *tp =
+				DEVICE_DT_GET_OR_NULL(DT_CHOSEN(zephyr_touch));
+
+			if (tp) {
+				if (device_is_ready(tp)) {
+					printk("touch: gt911 ready\n");
+				} else {
+					int trc;
+
+					/* do_device_init() marks initialized even
+					 * on failure — clear it or device_init()
+					 * is a silent -EALREADY no-op. */
+					tp->state->initialized = false;
+					trc = device_init(tp);
+					printk("touch: gt911 re-probe rc=%d %s\n",
+					       trc, device_is_ready(tp)
+						       ? "(bound)" : "(absent)");
+				}
+			}
+			touch_ready = tp && device_is_ready(tp);
+		}
 		if (dsi_ok && dsi_view == VIEW_IQ && !disp_hold &&
 		    iq_seen != iq_seq) {
 			dsi_scope();
 		}
 		k_msleep(20);
+		tick++;
 	}
 }
 K_THREAD_DEFINE(scope_th, 2048, scope_thread, NULL, NULL, NULL,

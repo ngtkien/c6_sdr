@@ -29,6 +29,9 @@
 #ifndef RING_BANK_STRIDE
 #define RING_BANK_STRIDE 0x10000u
 #endif
+#ifndef RING_BANK_HW_OFF
+#define RING_BANK_HW_OFF 0u         /* hardware bank == bank index */
+#endif
 #ifndef RING_PAIRS
 #define RING_PAIRS 16384u
 #define RING_THRESHOLD 12288u        /* switch banks after this many pairs */

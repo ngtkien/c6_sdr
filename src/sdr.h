@@ -71,6 +71,11 @@ int sdr_iq_burst_pull(uint32_t freq_hz, uint16_t n_pairs, uint8_t fmt,
 		      uint8_t *buf, uint32_t buf_cap, uint32_t *out_len,
 		      struct esp_ng_sdr_run_res *res);
 
+/* Factory RF-test CW tone on/off (IqStart mode 2/3) — emits real RF.
+ * backoff_qdb: attenuation in 0.25 dB units, 0 = full PA power. */
+int sdr_tone(uint32_t freq_hz, bool on, uint32_t backoff_qdb,
+	     struct esp_ng_sdr_run_res *res);
+
 #ifdef __cplusplus
 }
 #endif
