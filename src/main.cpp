@@ -336,18 +336,19 @@ static void view_color(uint8_t *r, uint8_t *g, uint8_t *b)
 }
 
 /* dB-like bin code -> RGB888 heat ramp (blue->cyan->green->amber->red) */
+/* ice ramp: deep blue -> blue -> cyan -> white (strong = bright) */
 static void db_rgb(uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
 {
 	uint32_t x = v; /* 0..255 */
 
-	if (x < 64) {        /* deep blue -> blue */
-		*r = 0; *g = x; *b = 96 + x;
+	if (x < 64) {         /* near-black -> deep blue */
+		*r = 0; *g = x / 2; *b = 64 + x;
 	} else if (x < 128) { /* blue -> cyan */
-		*r = 0; *g = 64 + (x - 64); *b = 160;
-	} else if (x < 192) { /* cyan -> green/amber */
-		*r = (x - 128) * 2; *g = 128 + (x - 128); *b = 128 - (x - 128);
-	} else {             /* amber -> red */
-		*r = 160 + (x - 192); *g = 255 - (x - 192) * 3; *b = 0;
+		*r = 0; *g = 32 + (x - 64); *b = 200;
+	} else if (x < 192) { /* cyan -> pale cyan */
+		*r = (x - 128); *g = 96 + (x - 128) * 2; *b = 230;
+	} else {              /* pale -> white */
+		*r = 96 + (x - 192) * 2; *g = 230; *b = 255;
 	}
 }
 
