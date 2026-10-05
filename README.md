@@ -57,15 +57,21 @@ int esp_ng_sdr_stop(void);
 ## Zephyr app
 
 Boot → hosted link check (MAC + `GetCoprocessorFwVersion`, warns if the
-C6 is still stock) → `C6_SDR_RUNS` sweeps of bounded `SdrSpec` runs from
-`C6_SDR_SWEEP_LO_MHZ` to `C6_SDR_SWEEP_HI_MHZ` → optional single-shot
-I/Q burst. Outputs (Kconfig):
+C6 is still stock) → single-shot I/Q burst → `C6_SDR_RUNS` sweeps
+(`0` = forever) of bounded `SdrSpec` runs from `C6_SDR_SWEEP_LO_MHZ` to
+`C6_SDR_SWEEP_HI_MHZ`. Outputs (Kconfig):
 
-- ASCII waterfall on the console (`freq bin-row ffts gain drops`).
-- Waterfall on the EK79007 DSI panel — one RGB888 heat-map row per
-  SPC1 frame, 1024×600 (`C6_SDR_DSI`).
-- Raw staged bytes appended to `/SD:/c6_sdr_spec.bin` and the IQ burst
-  to `/SD:/c6_sdr_iq.bin` (`C6_SDR_SD_DUMP`).
+- `C6_SDR_DSI=y` (default) — EK79007 DSI panel, 1024×600: scrolling
+  RGB888 heat-map waterfall (one row pushed per SPC1 frame, so the
+  display updates live), per-frequency MHz labels in the left gutter,
+  and a HUD with C6 MAC/fw version, live counters (sweep, rows, drops,
+  staged KB, current freq) and a dB colorbar.
+- `C6_SDR_ASCII_WF` — 96-column ASCII waterfall on the console
+  (`freq bin-row ffts gain drops`). Defaults to on only when DSI is
+  off; sweep summaries + errors always print either way.
+- `C6_SDR_SD_DUMP` — staged bytes appended to `/SD:/c6_sdr_spec.bin`,
+  IQ burst to `/SD:/c6_sdr_iq.bin`. A card that rejects writes is
+  disabled automatically after 4 failures.
 
 ```bash
 # 1. build + flash the C6 hybrid firmware (ESP-IDF ≥ 5.3)
@@ -88,7 +94,10 @@ cycle is reachable without opening the case.
 - **From hosted firmware (stock or v1.4.7):** plain OTA through
   `projects/c6_ota` works — the hybrid answers the same RPCs.
 - **From standalone ESP-SDR or any non-hosted image:** the hosted link
-  is gone, so only the ESP-Prog header works:
+  is gone — use `c6_ota`'s recovery mode (`CONFIG_C6_RECOVERY=y` or a
+  `/SD:/c6_download.flg` file): the P4 drives C6 BOOT via GPIO47 and
+  EN via GPIO54 into ROM download mode, then flash over the PROG_C6
+  UART:
 
   ```bash
   esptool --chip esp32c6 -p <PORT> -b 460800 write-flash \

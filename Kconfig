@@ -17,14 +17,19 @@ config C6_SDR_SWEEP_STEP_MHZ
 
 config C6_SDR_SPEC_MS
 	int "Per-point SPEC run duration (ms)"
-	default 200
+	default 300
 	help
 	  Bounded ring-capture run per frequency point; frames are pulled
-	  after each run completes.
+	  after each run completes. Keep staged bytes (~frames x 270 B)
+	  under the slave's 32 KiB sink or the ring overflows. Longer
+	  runs amortize RPC overhead → faster waterfall scroll.
 
 config C6_SDR_RUNS
-	int "Number of sweep repetitions"
-	default 3
+	int "Number of sweep repetitions (0 = forever)"
+	default 0
+	help
+	  0 keeps sweeping indefinitely — the usual choice when the DSI
+	  waterfall is the live display.
 
 config C6_SDR_NFFT
 	int "FFT size (power of two)"
@@ -32,11 +37,16 @@ config C6_SDR_NFFT
 
 config C6_SDR_STRIDE
 	int "FFT stride (process every Nth unit block)"
-	default 2
+	default 1
+	help
+	  1 = every captured unit produces an FFT (max frame rate).
 
 config C6_SDR_UNITS_PER_FRAME
 	int "Units merged per emitted frame"
-	default 4
+	default 2
+	help
+	  Smaller values emit more, thinner frames — faster waterfall
+	  scroll at lower per-row integration.
 
 config C6_SDR_MAX_HOLD
 	bool "Per-bin max-hold instead of mean power"
@@ -53,6 +63,14 @@ config C6_SDR_DCAP
 config C6_SDR_DSI
 	bool "Render waterfall on the DSI panel"
 	default y
+
+config C6_SDR_ASCII_WF
+	bool "ASCII waterfall rows on the serial console"
+	default y if !C6_SDR_DSI
+	help
+	  The 96-column text waterfall is heavy on a 115200 UART; leave it
+	  off when the DSI panel carries the display. Sweep summaries and
+	  errors are always printed.
 
 config C6_SDR_SD_DUMP
 	bool "Append captures to files on the SD card"
