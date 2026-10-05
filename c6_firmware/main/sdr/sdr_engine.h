@@ -41,6 +41,22 @@ int  sdr_spec_run(uint32_t freq_hz, uint8_t rate_code, uint16_t nfft,
                   uint8_t stride, uint8_t units_per_frame, bool max_hold,
                   bool stats, uint32_t duration_ms, sdr_run_result_t *res);
 
+/* Async variant: returns immediately, run executes in a dedicated task
+ * while the host drains the 32 KiB ring via sdr_stream_read. Bounded
+ * (duration_ms>0) runs stop on their own; unbounded runs need sdr_stop
+ * or they die when the undrained output stalls for 2 s. */
+int  sdr_spec_start(uint32_t freq_hz, uint8_t rate_code, uint16_t nfft,
+                    uint8_t stride, uint8_t units_per_frame, bool max_hold,
+                    bool stats, uint32_t duration_ms);
+
+/* Absolute-offset read of the stream ring. *pos = absolute position of
+ * dst[0] (> offset when stale data was overwritten — host resyncs),
+ * *produced = total bytes produced so far. */
+uint32_t sdr_stream_read(uint32_t offset, uint8_t *dst, uint32_t max_len,
+                         uint32_t *pos, uint32_t *produced);
+bool sdr_read_is_ring(void);    /* last run's output lives in the stream ring */
+uint32_t sdr_produced(void);    /* absolute bytes produced by the current run */
+
 /* IQ mode 0: single-shot burst into IQ_BUFFER (raw u32 words / packed).
  * fmt: 0 = raw u32 (4 B/pair), 16 = iq8 (2 B/pair), 20 = iq10 (5 B/2 pairs). */
 int  sdr_iq_burst(uint32_t freq_hz, uint8_t rate_code, uint16_t n_pairs,

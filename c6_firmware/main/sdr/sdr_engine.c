@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "heap_memory_layout.h"
 #include "soc/soc.h"
 
@@ -86,31 +87,85 @@ static void prepare_rx(void) {
 /* ---- capture output ------------------------------------------------------
  * SPEC frames and packed bursts append to sdr_cap; raw ring-CAPTURE units
  * stay in the SRAM banks and are read back through the unit table.
+ *
+ * sdr_cap is a true ring with absolute byte positions: the capture task
+ * produces at sdr_wr_abs, the host consumes via SdrIqRead at sdr_rd_abs.
+ * Reads reference absolute offsets, so the host can drain while the run
+ * still captures (stream mode) and a lagging reader resyncs to the
+ * oldest byte still held.
  */
 /* Hosted heap tops out around ~120 KiB; transport ~47 KiB + wifi ~35 KiB
- * leaves <40 KiB — 96 KiB was never reachable, 48 KiB starves sdio_init. */
-#define SDR_CAP_SIZE (32 * 1024)
+ * leaves <40 KiB — 96 KiB was never reachable, 48 KiB starves sdio_init.
+ * With live host draining the ring only needs to cover pull latency
+ * (~50 ms at ~95 KiB/s); 24 KiB keeps ~250 ms of slack and leaves the
+ * SDIO send-path a usable DMA block. */
+#define SDR_CAP_SIZE (24 * 1024)
 /* Heap-allocated at engine init: the .bss region must stay below the
- * 0x40820000 RF-dump guard, so the 96 KiB sink lives in the heap above
- * the reserved ring banks instead. */
+ * 0x40820000 RF-dump guard, so the sink lives in the heap above the
+ * reserved ring banks instead. */
 static uint8_t *sdr_cap;
-static volatile uint32_t sdr_cap_len;
+static volatile uint32_t sdr_wr_abs; /* total bytes produced */
+static volatile uint32_t sdr_rd_abs; /* bytes consumed by host reads */
 static volatile bool sdr_stop_flag;
 static volatile bool sdr_busy_flag;
 
-static enum { SRC_NONE, SRC_BUF, SRC_UNITS } read_src;
+static enum { SRC_NONE, SRC_BUF, SRC_UNITS, SRC_RING } read_src;
 static const uint8_t *read_base;
 static uint32_t read_len;
 static ring_result_t last_run;
 
+/* async run task (see sdr_spec_start below); stack + TCB allocated in
+ * sdr_engine_prealloc — heap, not .bss, which is hard-capped by the
+ * 0x40820000 RF-dump guard */
+static StaticTask_t *sdr_task_tcb;
+static StackType_t *sdr_task_stack;
+static TaskHandle_t sdr_task;
+static ring_config_t sdr_pending_cfg;
+static sdr_run_result_t sdr_async_res;
+static void sdr_run_task(void *arg);
+
 int ring_write(const uint8_t *data, size_t len) {
-    uint32_t room = SDR_CAP_SIZE - sdr_cap_len;
-    size_t n = len < room ? len : room;
+    uint32_t used = sdr_wr_abs - sdr_rd_abs;
+    uint32_t space = SDR_CAP_SIZE - (used > SDR_CAP_SIZE ? SDR_CAP_SIZE : used);
+    size_t n = len < space ? len : space;
     if (n) {
-        memcpy(sdr_cap + sdr_cap_len, data, n);
-        sdr_cap_len += (uint32_t)n;
+        uint32_t off = sdr_wr_abs % SDR_CAP_SIZE;
+        uint32_t first = SDR_CAP_SIZE - off;
+        if (first > n) first = n;
+        memcpy(sdr_cap + off, data, first);
+        if (n > first) memcpy(sdr_cap, data + first, n - first);
+        sdr_wr_abs += (uint32_t)n;
     }
     return (int)n;
+}
+
+/* Absolute-position read for SRC_RING: returns bytes copied; *pos is the
+ * absolute offset of dst[0] (advanced past the requested offset when the
+ * host fell behind and stale bytes were overwritten), *produced is the
+ * running total. Consumed bytes advance sdr_rd_abs so ring_write sees
+ * the freed space. */
+uint32_t sdr_stream_read(uint32_t offset, uint8_t *dst, uint32_t max_len,
+                         uint32_t *pos, uint32_t *produced) {
+    uint32_t wr = sdr_wr_abs;
+    uint32_t used = wr - sdr_rd_abs;
+    uint32_t avail = used > SDR_CAP_SIZE ? SDR_CAP_SIZE : used;
+    uint32_t oldest = wr - avail;
+    uint32_t p = offset < oldest ? oldest : offset;
+    uint32_t n = wr - p;
+
+    if (n > max_len) n = max_len;
+    if (n) {
+        uint32_t off = p % SDR_CAP_SIZE;
+        uint32_t first = SDR_CAP_SIZE - off;
+        if (first > n) first = n;
+        memcpy(dst, sdr_cap + off, first);
+        if (n > first) memcpy(dst + first, sdr_cap, n - first);
+        uint32_t rd = p + n;
+        if ((int32_t)(rd - sdr_rd_abs) > 0) sdr_rd_abs = rd;
+    }
+    *pos = p;
+    *produced = wr;
+    return n;
 }
 int ring_input_available(void) { return 0; }
 int ring_read_byte(uint8_t *b) { (void)b; return -1; }
@@ -232,6 +287,21 @@ int sdr_engine_prealloc(void) {
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "capture sink %u KiB reserved", SDR_CAP_SIZE / 1024);
+    /* runner-task stack + TCB while the pre-wifi heap is still roomy;
+     * the task itself is only kicked by sdr_spec_start(). Stack bytes
+     * come out of the same DMA pool the SDIO send path needs, so keep
+     * it tight: 3 KiB covers FFT + frame assembly. */
+    sdr_task_stack = heap_caps_malloc(3072,
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    sdr_task_tcb = heap_caps_malloc(sizeof(StaticTask_t),
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (sdr_task_stack && sdr_task_tcb) {
+        sdr_task = xTaskCreateStatic(sdr_run_task, "sdr_run", 3072,
+                                   NULL, 5, sdr_task_stack, sdr_task_tcb);
+    }
+    if (!sdr_task) {
+        ESP_LOGW(TAG, "no run task — async spec streaming unavailable");
+    }
     return ESP_OK;
 }
 
@@ -252,6 +322,8 @@ int sdr_engine_init(void) {
 
 bool sdr_engine_ready(void) { return rx_ready; }
 bool sdr_busy(void) { return sdr_busy_flag; }
+bool sdr_read_is_ring(void) { return read_src == SRC_RING; }
+uint32_t sdr_produced(void) { return sdr_wr_abs; }
 
 /* ---- run wrappers ---------------------------------------------------------- */
 
@@ -265,12 +337,13 @@ static void run_translate(const ring_result_t *r, sdr_run_result_t *res) {
     res->drops = r->drops;
     res->abandoned = r->abandoned;
     res->ffts = r->ffts;
-    res->total_len = sdr_cap_len;
+    res->total_len = sdr_wr_abs;
     res->stopped = r->stopped_by_host;
 }
 
 static int ring_run(const ring_config_t *cfg, sdr_run_result_t *res) {
-    sdr_cap_len = 0;
+    sdr_wr_abs = 0;
+    sdr_rd_abs = 0;
     sdr_stop_flag = false;
     sdr_busy_flag = true;
     ring_capture_init();
@@ -302,12 +375,49 @@ int sdr_spec_run(uint32_t freq_hz, uint8_t rate_code, uint16_t nfft,
     };
     int rc = ring_run(&cfg, res);
     if (!rc) {
-        res->total_len = sdr_cap_len;
-        read_src = SRC_BUF;
-        read_base = sdr_cap;
-        read_len = sdr_cap_len;
+        res->total_len = sdr_wr_abs;
+        read_src = SRC_RING;
+        read_len = sdr_wr_abs;
     }
     return rc;
+}
+
+/* ---- async runs: capture in a dedicated task so the RPC handler can
+ * answer immediately and the host drains via SdrIqRead while the run is
+ * still producing. */
+static void sdr_run_task(void *arg) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ring_run(&sdr_pending_cfg, &sdr_async_res);
+        ESP_LOGI(TAG, "run done: st=%u units=%lu frames=%lu drops=%lu len=%lu stk=%lu",
+                 (unsigned)last_run.status, (unsigned long)last_run.units,
+                 (unsigned long)last_run.frames,
+                 (unsigned long)last_run.drops, (unsigned long)sdr_wr_abs,
+                 (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+    }
+}
+
+int sdr_spec_start(uint32_t freq_hz, uint8_t rate_code, uint16_t nfft,
+                   uint8_t stride, uint8_t units_per_frame, bool max_hold,
+                   bool stats, uint32_t duration_ms) {
+    if (sdr_busy_flag) return ESP_ERR_INVALID_STATE;
+    if (freq_hz && sdr_set_freq(freq_hz)) return ESP_ERR_INVALID_ARG;
+    if (rate_code != 0 || nfft != 256 || !stride || stride > 64 ||
+        !units_per_frame || duration_ms > 86400000u)
+        return ESP_ERR_INVALID_ARG;
+    if (!sdr_task) return ESP_ERR_INVALID_STATE;
+    sdr_pending_cfg = (ring_config_t){
+        .mode = RING_MODE_SPEC, .rate = rate_code,
+        .duration_ms = duration_ms, .nfft = nfft, .stride = stride,
+        .units_per_frame = units_per_frame, .max_hold = max_hold,
+        .stats = stats,
+    };
+    read_src = SRC_RING;
+    sdr_wr_abs = 0;
+    sdr_rd_abs = 0;
+    sdr_busy_flag = true; /* reads see TIMEOUT, not drained, before task wakes */
+    xTaskNotifyGive(sdr_task);
+    return 0;
 }
 
 int sdr_iq_burst(uint32_t freq_hz, uint8_t rate_code, uint16_t n_pairs,

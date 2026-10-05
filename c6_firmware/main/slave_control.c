@@ -1955,7 +1955,10 @@ static esp_err_t sdr_ensure_radio(void)
  * mallocs chunk+41B with MALLOC_CAP_DMA; post-wifi lfb-dma is <1 KiB, so
  * 1400 B responses fail malloc and the host times out. 640 B (681 B
  * with overhead) still clears the ~816 B worst-case free block. */
-#define SDR_MAX_READ_CHUNK 640u /* keep under the host rpc buffer */
+/* read-chunk cap: +41 B of envelope stays under the host's 1600 B
+ * nanopb field, and the resulting ~1.5 KB SDIO send buffer fits the
+ * post-streaming DMA headroom (~6 KB lfb) */
+#define SDR_MAX_READ_CHUNK 1400u
 
 static esp_err_t req_sdr_spec_handler(Rpc *req, Rpc *resp, void *priv_data)
 {
@@ -1976,28 +1979,21 @@ static esp_err_t req_sdr_spec_handler(Rpc *req, Rpc *resp, void *priv_data)
 		RPC_RET_FAIL_IF(resp_payload->resp);
 	}
 
-	sdr_run_result_t r;
-	esp_err_t rc = sdr_spec_run(req_payload->freq_hz,
+	/* async: the run executes in the engine task; the host drains the
+	 * ring via SdrIqRead while capture is still producing. */
+	esp_err_t rc = sdr_spec_start(req_payload->freq_hz,
 			(uint8_t)req_payload->rate_code, (uint16_t)req_payload->nfft,
 			(uint8_t)req_payload->stride, (uint8_t)req_payload->units_per_frame,
 			req_payload->max_hold, req_payload->stats,
-			req_payload->duration_ms, &r);
-	ESP_LOGI(TAG, "spec run: rc=%d st=%u/%u units=%lu pairs=%llu "
-	       "ffts=%lu frames=%lu drops=%lu len=%lu",
-	       rc, (unsigned)r.status, (unsigned)r.detail,
-	       (unsigned long)r.units, (unsigned long long)r.pairs,
-	       (unsigned long)r.ffts, (unsigned long)r.frames,
-	       (unsigned long)r.drops, (unsigned long)r.total_len);
+			req_payload->duration_ms);
+	ESP_LOGI(TAG, "spec start: rc=%d f=%lu dur=%lums",
+	       rc, (unsigned long)req_payload->freq_hz,
+	       (unsigned long)req_payload->duration_ms);
 	RPC_RET_FAIL_IF(rc);
 	resp_payload->nfft = req_payload->nfft;
 	resp_payload->freq_hz = req_payload->freq_hz;
 	resp_payload->rate_hz = ring_capture_rate_hz(req_payload->rate_code);
-	resp_payload->pairs = r.pairs;
-	resp_payload->elapsed_us = (uint32_t)r.elapsed_us;
-	resp_payload->frames = r.frames;
-	resp_payload->total_len = r.total_len;
-	resp_payload->status = r.status;
-	resp_payload->detail = r.detail;
+	/* pairs/frames/elapsed/total_len stay 0 — the stream reports them */
 	return ESP_OK;
 }
 
@@ -2057,6 +2053,26 @@ static esp_err_t req_sdr_iq_read_handler(Rpc *req, Rpc *resp, void *priv_data)
 	uint8_t *buf = malloc(want);
 	if (!buf) {
 		resp_payload->resp = ESP_ERR_NO_MEM;
+		return ESP_OK;
+	}
+	if (sdr_read_is_ring()) {
+		/* stream semantics: offset echoes the absolute position of
+		 * the first returned byte (resyncs a lagging host), total_len
+		 * is bytes produced; resp codes: 0 = data, ESP_ERR_TIMEOUT =
+		 * run alive but nothing new, ESP_ERR_NOT_FOUND = drained. */
+		uint32_t pos = 0, produced = 0;
+		uint32_t got = sdr_stream_read(req_payload->offset, buf, want,
+					       &pos, &produced);
+		resp_payload->offset = pos;
+		resp_payload->total_len = produced;
+		if (got) {
+			resp_payload->data.data = buf;
+			resp_payload->data.len = got;
+		} else {
+			free(buf);
+			resp_payload->resp = sdr_busy() ?
+				ESP_ERR_TIMEOUT : ESP_ERR_NOT_FOUND;
+		}
 		return ESP_OK;
 	}
 	uint32_t total = 0;
