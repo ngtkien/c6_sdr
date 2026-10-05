@@ -29,8 +29,10 @@
 #include <zephyr/sys/printk.h>
 #include <bsp/esp32p4_bsp.h>
 
+#include <math.h>
 #include "esp_hosted_ng.h"
 #include "sdr.h"
+#include "audio.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -130,7 +132,7 @@ static void sd_append(const char *path, const uint8_t *buf, uint32_t len)
 
 /* display modes — cycled by the BOOT button (sw0); each owns the full
  * area below the HUD — no split views on a 600 px panel */
-enum dsi_view { VIEW_WF = 0, VIEW_SPEC, VIEW_PANO, VIEW_N };
+enum dsi_view { VIEW_WF = 0, VIEW_SPEC, VIEW_PANO, VIEW_IQ, VIEW_N };
 
 static uint8_t fb[PANEL_W * PANEL_H * 3] __aligned(64)
 	__attribute__((section(".ext_ram.bss")));
@@ -279,6 +281,7 @@ static const char *view_name(void)
 	switch (dsi_view) {
 	case VIEW_SPEC:  return "SPEC";
 	case VIEW_PANO:  return "PANO";
+	case VIEW_IQ:    return "IQ";
 	default:         return "WFL";
 	}
 }
@@ -288,6 +291,7 @@ static const char *view_title(void)
 	switch (dsi_view) {
 	case VIEW_SPEC:  return "PSD MAX-HOLD";
 	case VIEW_PANO:  return "SWEPT SURVEY";
+	case VIEW_IQ:    return "IQ SCOPE";
 	default:         return "SPECTROGRAM";
 	}
 }
@@ -297,6 +301,7 @@ static void view_color(uint8_t *r, uint8_t *g, uint8_t *b)
 	switch (dsi_view) {
 	case VIEW_SPEC:  *r = 120; *g = 220; *b = 255; break;
 	case VIEW_PANO:  *r = 255; *g = 170; *b = 60;  break;
+	case VIEW_IQ:    *r = 255; *g = 110; *b = 255; break;
 	default:         *r = 80;  *g = 255; *b = 160; break;
 	}
 }
@@ -523,6 +528,69 @@ static void dsi_trace(const uint8_t *bins, uint32_t nfft, uint32_t freq_hz)
 	}
 }
 
+/* ---------- IQ scope: constellation of the latest iq8 burst ---------- */
+#define IQ_SCOPE_PTS 4096          /* iq8 pairs per burst            */
+#define IQ_SCOPE_SCALE 2           /* px per LSB                     */
+static int8_t iq_pts[2 * IQ_SCOPE_PTS];
+static volatile uint32_t iq_seq, iq_seen;
+
+static void dsi_scope(void)
+{
+	int cx = PANEL_W / 2, cy = (WF_TOP + PANEL_H) / 2;
+	uint8_t *p;
+
+	if (iq_seen == iq_seq) {
+		return;
+	}
+	iq_seen = iq_seq;
+	fb_fill(0, WF_TOP, PANEL_W, PANEL_H - WF_TOP, 0, 0, 8);
+	/* axes */
+	fb_fill(cx - 256, cy, 512, 1, 60, 60, 80);
+	fb_fill(cx, cy - 256, 1, 512, 60, 60, 80);
+	/* unit circle guide: square frame at +-128 LSB */
+	for (int i = -256; i <= 256; i += 4) {
+		p = fb + ((cy - 256) * PANEL_W + cx + i) * 3;
+		p[0] = 50; p[1] = 50; p[2] = 70;
+		p = fb + ((cy + 256) * PANEL_W + cx + i) * 3;
+		p[0] = 50; p[1] = 50; p[2] = 70;
+		p = fb + ((cy + i) * PANEL_W + cx - 256) * 3;
+		p[0] = 50; p[1] = 50; p[2] = 70;
+		p = fb + ((cy + i) * PANEL_W + cx + 256) * 3;
+		p[0] = 50; p[1] = 50; p[2] = 70;
+	}
+	for (int i = 0; i < IQ_SCOPE_PTS; i++) {
+		int x = cx + iq_pts[i * 2] * IQ_SCOPE_SCALE;
+		int y = cy - iq_pts[i * 2 + 1] * IQ_SCOPE_SCALE;
+
+		p = fb + (y * PANEL_W + x) * 3;
+		p[0] = 80; p[1] = 255; p[2] = 200;
+	}
+	sys_cache_data_flush_range(fb + WF_TOP * PANEL_W * 3,
+				   (PANEL_H - WF_TOP) * PANEL_W * 3);
+}
+
+/* FM discriminator on the iq8 burst -> stretched PCM blip (~40 ms).
+ * diff-phase per pair = instantaneous frequency; resampled 4096->2048
+ * samples ≈ 51us of signal played back ~400x slower. Honest blip. */
+static void iq_blip(const int8_t *xy, uint32_t n)
+{
+	static int16_t pcm[2048];
+
+	if (!audio_ready() || n < 64) {
+		return;
+	}
+	for (uint32_t i = 0; i < 2048; i++) {
+		uint32_t k = 1 + i * (n - 2) / 2048;
+		int dI = (int)xy[k * 2] * xy[k * 2 - 2] +
+			 (int)xy[k * 2 + 1] * xy[k * 2 - 1];
+		int dQ = (int)xy[k * 2 + 1] * xy[k * 2 - 2] -
+			 (int)xy[k * 2] * xy[k * 2 - 1];
+
+		pcm[i] = (int16_t)(atan2f((float)dQ, (float)dI) * 3000);
+	}
+	audio_play(pcm, 2048);
+}
+
 /* freq grid for the panorama: vertical line + label every sweep step */
 static void pano_grid(void)
 {
@@ -559,6 +627,9 @@ static void dsi_view_apply(int v)
 		tr_hgt = PANEL_H - WF_TOP - 12;
 		tr_pano = true;
 		wf_top = PANEL_H;
+	} else if (v == VIEW_IQ) {
+		tr_top = tr_hgt = 0;
+		wf_top = PANEL_H; /* scope owns the frame */
 	} else {
 		tr_top = 0;
 		tr_hgt = 0;
@@ -810,6 +881,21 @@ static void disp_thread(void *a, void *b, void *c)
 K_THREAD_DEFINE(disp_th, 4096, disp_thread, NULL, NULL, NULL,
 		K_PRIO_COOP(9), 0, 0);
 
+/* scope + blip pump: runs alongside the display thread; the sweep loop
+ * drops iq8 bursts into iq_pts and this repaints + plays them */
+static void scope_thread(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	for (;;) {
+		if (dsi_ok && dsi_view == VIEW_IQ && iq_seen != iq_seq) {
+			dsi_scope();
+		}
+		k_msleep(20);
+	}
+}
+K_THREAD_DEFINE(scope_th, 2048, scope_thread, NULL, NULL, NULL,
+		K_PRIO_COOP(10), 0, 0);
+
 static bool sdr_row_cb(const struct sdr_spc1 *h, const uint8_t *bins,
 		       void *arg)
 {
@@ -937,6 +1023,7 @@ int main(void)
 	}
 	dsi_view_apply(CONFIG_C6_SDR_DSI_VIEW);
 #endif
+	audio_init();
 
 	/* ---- single-shot I/Q burst (once, feeds the HUD + SD dump) ---- */
 	if (IS_ENABLED(CONFIG_C6_SDR_IQ_BURST)) {
@@ -995,6 +1082,32 @@ int main(void)
 
 			st_freq_mhz = f;
 			st_label_pending = true;
+			if (dsi_ok && dsi_view == VIEW_IQ) {
+				/* IQ view: bursts instead of sweeps — the
+				 * scope + demod blip own the slot */
+				struct esp_ng_sdr_run_res ires;
+				uint32_t ilen = 0;
+
+				ret = sdr_iq_burst_pull(f * 1000000u,
+							IQ_SCOPE_PTS, 16, gain,
+							ESP_NG_SDR_DCAP_AUTO,
+							cap_buf, CAP_MAX,
+							&ilen, &ires);
+				if (!ret && ilen >= 8 && !ires.status) {
+					uint32_t n = MIN(ilen / 2,
+							 IQ_SCOPE_PTS);
+					memcpy(iq_pts, cap_buf, n * 2);
+					iq_seq++;
+					iq_blip(iq_pts, n);
+					total += ilen;
+					st_staged += ilen;
+					hud_update();
+					if (dsi_ok) {
+						dsi_hud();
+					}
+				}
+				continue;
+			}
 			ret = sdr_spec_stream(f * 1000000u, 256,
 					      CONFIG_C6_SDR_STRIDE,
 					      CONFIG_C6_SDR_UNITS_PER_FRAME,

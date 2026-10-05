@@ -32,9 +32,9 @@ config C6_SDR_RUNS
 	  waterfall is the live display.
 
 config C6_SDR_DSI_VIEW
-	int "Initial DSI view (0=waterfall, 1=spectrum trace, 2=panorama)"
+	int "Initial DSI view (0=waterfall, 1=spectrum trace, 2=panorama, 3=iq scope)"
 	default 1
-	range 0 2
+	range 0 3
 	depends on C6_SDR_DSI
 	help
 	  Each view owns the full area below the HUD; BOOT button cycles:

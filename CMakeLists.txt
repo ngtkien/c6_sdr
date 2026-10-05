@@ -7,6 +7,7 @@ project(c6_sdr CXX)
 target_sources(app PRIVATE
 	src/main.cpp
 	src/sdr.cpp
+	src/audio.cpp
 )
 # ESP32-P4 spectrum / raw-IQ front-end driven through the c6_sdr hybrid
 # slave firmware on the ESP32-C6 over the ESP-Hosted SDIO link.
