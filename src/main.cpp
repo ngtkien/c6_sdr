@@ -1267,6 +1267,8 @@ static void disp_thread(void *a, void *b, void *c)
 			view_button_poll();
 			continue;
 		}
+		view_button_poll(); /* per-row too — else buttons starve
+				     * while the queue never empties */
 		if (disp_hold) {
 			continue;
 		}
